@@ -65,11 +65,20 @@ int llama_shard_layer_tensors(
         uint64_t    * out_file_offsets,
         uint64_t    * out_nbytes,
         int           cap) {
-    (void) model; (void) layer; (void) out_tensors;
-    (void) out_file_offsets; (void) out_nbytes; (void) cap;
-    // TODO(M2): enumerate blk.<layer>.* weight tensors with their gguf file offsets + byte
-    // sizes. The offset map lives on the transient llama_model_loader (weights_map) and is not
-    // retained on the model after load; wiring it through is deferred to the streamer work.
-    // The clamp and the materialize/evict call site do not depend on this accessor.
-    return 0;
+    if (!model || layer < 0 || layer >= (int) model->shard_layer_map.size()) {
+        return 0;
+    }
+    const auto & v = model->shard_layer_map[layer];
+    const int total = (int) v.size();
+    // NULL out pointers => query the count only.
+    if (!out_tensors && !out_file_offsets && !out_nbytes) {
+        return total;
+    }
+    const int n = (cap < total) ? cap : total;
+    for (int i = 0; i < n; ++i) {
+        if (out_tensors)      { out_tensors[i]      = (const void *) v[i].tensor; }
+        if (out_file_offsets) { out_file_offsets[i] = v[i].file_offset; }
+        if (out_nbytes)       { out_nbytes[i]       = v[i].nbytes; }
+    }
+    return n;
 }

@@ -26,6 +26,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -1501,6 +1502,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
+    }
+
+    // ShardLLM seam: retain a compact per-layer {tensor, file_offset, nbytes} map so the
+    // out-of-tree streamer can pread + rebind blk.<layer>.* tensors by their gguf file offset.
+    // Offsets come from the loader's weights_map (discarded after load); the tensor pointer MUST
+    // be the model's REAL compute tensor (tensors_by_name), not the loader's meta tensor — only
+    // the former's ->data is what the CPU backend reads at compute time. Non-blk tensors
+    // (tok_embd/output/norm) are never streamed and are intentionally omitted.
+    shard_layer_map.assign(hparams.n_layer(), {});
+    for (const auto & [name, t] : tensors_by_name) {
+        int il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0 || il >= (int) shard_layer_map.size()) {
+            continue;
+        }
+        auto it = ml.weights_map.find(name);
+        if (it == ml.weights_map.end() || !t) {
+            continue;
+        }
+        shard_layer_map[il].push_back({ t, (uint64_t) it->second.offs, (uint64_t) ggml_nbytes(t) });
     }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);

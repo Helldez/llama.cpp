@@ -636,6 +636,12 @@ struct llama_model {
     int  (*shard_ws_materialize)(void *, int layer) = nullptr; // returns 0 on success
     void (*shard_ws_evict)(void *, int layer)       = nullptr;
 
+    // ShardLLM seam: per-layer weight-tensor offset map, retained from the loader so the
+    // out-of-tree O_DIRECT streamer can pread + rebind blk.<layer>.* by gguf file offset
+    // (see llama_shard_layer_tensors). Filled once at load; empty when streaming is unused.
+    struct shard_layer_tensor { struct ggml_tensor * tensor; uint64_t file_offset; uint64_t nbytes; };
+    std::vector<std::vector<shard_layer_tensor>> shard_layer_map;
+
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 
