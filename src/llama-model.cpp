@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-shard.h"
 
 #include "models/models.h"
 
@@ -2195,6 +2196,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
+                        }
+                    }
+
+                    // ShardLLM seam (K-context streaming): if the current thread set a
+                    // partial-forward range, this context only computes layers [pf_start, pf_end),
+                    // so allocate KV ONLY for that range. Without this, every one of the K partial
+                    // contexts allocates a full n_layer KV cache => K x KV per device => OOM on the
+                    // >RAM model. Defaults (0, INT_MAX) leave the filter untouched, so non-streaming
+                    // usage is unaffected. Composes with any arch filter set above. Applies to the
+                    // standard llama_kv_cache path (qwen2/qwen3); SWA/hybrid/recurrent/dsv4 variants
+                    // below keep their own filters (streaming targets non-SWA archs only).
+                    {
+                        int32_t pf_start = 0, pf_end = INT32_MAX;
+                        llama_shard_get_partial_forward(&pf_start, &pf_end);
+                        if (pf_start > 0 || pf_end < (int32_t) hparams.n_layer()) {
+                            llama_kv_cache::layer_filter_cb base = filter; // compose with arch filter
+                            filter = [base, pf_start, pf_end](int32_t il) {
+                                if (base && !base(il)) { return false; }
+                                return il >= pf_start && il < pf_end;
+                            };
                         }
                     }
 
