@@ -629,6 +629,13 @@ struct llama_model {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
+    // ShardLLM seam: on-demand weight source (see src/llama-shard.cpp). When
+    // shard_ws_materialize is set, each layer in the active partial-forward range is
+    // materialized just before graph compute and evicted after. Null == resident default.
+    void * shard_ws_user_data                       = nullptr;
+    int  (*shard_ws_materialize)(void *, int layer) = nullptr; // returns 0 on success
+    void (*shard_ws_evict)(void *, int layer)       = nullptr;
+
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 

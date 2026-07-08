@@ -1589,6 +1589,46 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // ShardLLM seam (see src/llama-shard.cpp)
+    //
+    // Narrow, plain-C hooks that let an out-of-tree engine drive block-by-block
+    // ("partial forward") execution and supply layer weights on demand. The public,
+    // versioned surface lives in the parent repo's seam/include/shardllm_seam.h; the
+    // seam target forwards to these symbols. Keeping them primitive-typed here means
+    // llama.cpp does not depend on the parent header and still builds standalone.
+
+    // Restrict the next decode(s) to the transformer layer range [begin, end). The
+    // range is THREAD-LOCAL so concurrent contexts do not race. Default (0, INT32_MAX)
+    // == full forward.
+    LLAMA_API void llama_shard_set_partial_forward(int32_t begin, int32_t end);
+    LLAMA_API void llama_shard_clear_partial_forward(void);
+    LLAMA_API void llama_shard_get_partial_forward(int32_t * begin, int32_t * end);
+
+    // 1 if the loaded architecture applies the partial-forward clamp (qwen2 / qwen3).
+    LLAMA_API int  llama_shard_supports_partial_forward(const struct llama_model * model);
+    LLAMA_API int  llama_shard_abi_version(void);
+
+    // Install an on-demand weight source. Each layer in the active range is materialized
+    // just before graph compute and evicted after. Pass materialize == NULL to restore
+    // the default (fully resident) behaviour. materialize returns 0 on success.
+    LLAMA_API void llama_shard_set_weight_source(
+            struct llama_model * model,
+            void * user_data,
+            int  (*materialize)(void * user_data, int layer),
+            void (*evict)(void * user_data, int layer));
+
+    // Enumerate a transformer block's weight tensors with their gguf file offsets and
+    // byte sizes (read-only; the pread + rebind lives out of tree). Returns the count
+    // written (<= cap), or the total count if the out pointers are NULL.
+    LLAMA_API int  llama_shard_layer_tensors(
+            const struct llama_model * model,
+            int          layer,
+            const void ** out_tensors,     // ggml_tensor *
+            uint64_t    * out_file_offsets,
+            uint64_t    * out_nbytes,
+            int           cap);
+
 #ifdef __cplusplus
 }
 #endif

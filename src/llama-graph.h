@@ -1025,6 +1025,19 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr) const;
 
     //
+    // ShardLLM seam: partial-forward clamp (see src/llama-shard.cpp)
+    //
+
+    // Fills [pf_start, pf_end) with the clamped layer range this stage must compute and
+    // returns pf_tail (true when the range ends at n_layer, i.e. this stage runs the
+    // final output_norm + lm_head). Default range (full forward) => (0, n_layer), true.
+    bool pf_range(int & pf_start, int & pf_end) const;
+
+    // A non-tail stage's finish: expose the raw residual `cur` as the boundary hidden
+    // (read back via the embeddings API) and expand the graph, skipping norm + lm_head.
+    void pf_emit_boundary(ggml_tensor * cur) const;
+
+    //
     // inputs
     //
 

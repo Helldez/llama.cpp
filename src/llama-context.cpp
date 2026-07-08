@@ -10,8 +10,10 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-shard.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1361,7 +1363,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // ShardLLM seam: materialize the active partial-forward layer range on demand just before
+    // compute, and evict it after. No-op unless an engine installed a weight source. The range
+    // is clamped to [0, n_layer); default (full forward) materializes every layer.
+    int pf_start = 0, pf_end = (int) model.hparams.n_layer();
+    if (model.shard_ws_materialize) {
+        int32_t s = 0, e = INT32_MAX;
+        llama_shard_get_partial_forward(&s, &e);
+        pf_start = std::max(0,        std::min((int) model.hparams.n_layer(), (int) s));
+        pf_end   = std::max(pf_start, std::min((int) model.hparams.n_layer(), (int) e));
+        for (int il = pf_start; il < pf_end; ++il) {
+            if (model.shard_ws_materialize(model.shard_ws_user_data, il) != 0) {
+                LLAMA_LOG_ERROR("%s: weight source failed to materialize layer %d\n", __func__, il);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (model.shard_ws_evict) {
+        for (int il = pf_start; il < pf_end; ++il) {
+            model.shard_ws_evict(model.shard_ws_user_data, il);
+        }
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

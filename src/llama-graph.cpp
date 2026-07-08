@@ -12,8 +12,11 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-shard.h"
 
+#include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -2127,6 +2130,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 // input embeddings with optional lora
+// ShardLLM seam: partial-forward clamp. Mirrors the diffusion-gemma reference. The range
+// is thread-local (llama_shard_get_partial_forward); default (0, INT32_MAX) => full forward.
+bool llm_graph_context::pf_range(int & pf_start, int & pf_end) const {
+    int32_t s = 0, e = INT32_MAX;
+    llama_shard_get_partial_forward(&s, &e);
+    pf_start = std::max(0,       std::min((int) n_layer, (int) s));
+    pf_end   = std::max(pf_start, std::min((int) n_layer, (int) e));
+    return pf_end >= (int) n_layer; // pf_tail
+}
+
+void llm_graph_context::pf_emit_boundary(ggml_tensor * cur) const {
+    res->t_embd = cur;
+    ggml_build_forward_expand(gf, cur);
+}
+
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
