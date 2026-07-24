@@ -68,6 +68,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // ShardLLM seam: clamp the computed layer range to [pf_start, pf_end). See models/qwen3.cpp
+    // for the rationale; a non-tail stage skips the final norm + lm_head and emits the raw
+    // residual. This is what lets MoEMesh split a MoE model's layers across devices.
+    int pf_start, pf_end;
+    const bool pf_tail = pf_range(pf_start, pf_end);
+
     inpL = build_inp_embd(model.tok_embd);
 
     // inp_pos - contains the positions
@@ -75,9 +81,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Only the tail stage reduces the residual to the output positions.
+    ggml_tensor * inp_out_ids = pf_tail ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = pf_start; il < pf_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -161,6 +168,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    // ShardLLM seam: a non-tail stage emits the raw residual as the boundary hidden and stops.
+    if (!pf_tail) {
+        pf_emit_boundary(cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

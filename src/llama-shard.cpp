@@ -39,8 +39,12 @@ void llama_shard_clear_partial_forward(void) {
 
 int llama_shard_supports_partial_forward(const struct llama_model * model) {
     if (!model) { return 0; }
-    // Only architectures whose graph applies the partial-forward clamp.
-    return (model->arch == LLM_ARCH_QWEN2 || model->arch == LLM_ARCH_QWEN3) ? 1 : 0;
+    // Only architectures whose graph applies the partial-forward clamp. QWEN3MOE is added for
+    // MoEMesh (splitting a MoE model's layers across devices); its builder honors pf_range the
+    // same way the dense Qwen builders do.
+    return (model->arch == LLM_ARCH_QWEN2 ||
+            model->arch == LLM_ARCH_QWEN3 ||
+            model->arch == LLM_ARCH_QWEN3MOE) ? 1 : 0;
 }
 
 int llama_shard_abi_version(void) {
