@@ -42,6 +42,12 @@ int llama_shard_supports_partial_forward(const struct llama_model * model) {
     // Only architectures whose graph applies the partial-forward clamp. QWEN3MOE is added for
     // MoEMesh (splitting a MoE model's layers across devices); its builder honors pf_range the
     // same way the dense Qwen builders do.
+    // NOTE: QWEN35MOE (Qwen3.6) is deliberately NOT listed. Its graph builder honors the clamp
+    // (see src/models/qwen35moe.cpp), but it is a HYBRID Gated-Delta-Net + attention MoE: the
+    // recurrent (delta-net) state is not carried across a partial-forward layer split by the
+    // current KV-range filter, so a clamped context fails buffer assignment
+    // (GGML_ASSERT(buffer) in ggml-backend). Re-add it here once the seam handles the recurrent
+    // memory per layer range. Pure-attention Qwen MoE (qwen3moe) is supported.
     return (model->arch == LLM_ARCH_QWEN2 ||
             model->arch == LLM_ARCH_QWEN3 ||
             model->arch == LLM_ARCH_QWEN3MOE) ? 1 : 0;

@@ -175,10 +175,16 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // ShardLLM seam: clamp the computed layer range to [pf_start, pf_end). A non-tail stage skips
+    // the final norm + lm_head and emits the raw residual (MoEMesh distributed split). Each node
+    // keeps its own layers' attention + recurrent state; only the boundary hidden crosses.
+    int pf_start, pf_end;
+    const bool pf_tail = pf_range(pf_start, pf_end);
+    ggml_tensor * inp_out_ids = pf_tail ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = pf_start; il < pf_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -228,6 +234,13 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         inpL = cur;
     }
     cur = inpL;
+
+    // ShardLLM seam: a non-tail stage emits the raw residual as the boundary hidden and stops,
+    // before the final norm + lm_head (which the conductor's tail stage runs).
+    if (!pf_tail) {
+        pf_emit_boundary(cur);
+        return;
+    }
 
     // post-norm hidden state feeds both the LM head and the MTP seed below
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
