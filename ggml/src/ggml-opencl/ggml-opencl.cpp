@@ -7395,6 +7395,173 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
     return GGML_STATUS_SUCCESS;
 }
 
+// Staging for per-slice expert uploads. Reused across calls and grown on demand: a slice upload
+// happens once per routed expert per layer per token, so allocating a buffer per call would cost
+// more driver time than the copy it serves.
+static cl_context g_expert_stage_ctx  = nullptr;
+static cl_mem     g_expert_stage      = nullptr;
+static size_t     g_expert_stage_size = 0;
+
+static cl_mem ggml_cl_expert_stage(cl_context context, size_t size) {
+    if (g_expert_stage != nullptr && g_expert_stage_ctx == context && g_expert_stage_size >= size) {
+        return g_expert_stage;
+    }
+    if (g_expert_stage != nullptr) {
+        CL_CHECK(clReleaseMemObject(g_expert_stage));
+        g_expert_stage = nullptr;
+    }
+    cl_int err;
+    g_expert_stage = clCreateBuffer(context, CL_MEM_READ_ONLY, size, NULL, &err);
+    CL_CHECK(err);
+    g_expert_stage_ctx  = context;
+    g_expert_stage_size = size;
+    return g_expert_stage;
+}
+
+static ggml_opencl_moe_slot_hook_t g_moe_slot_hook      = nullptr;
+static void *                      g_moe_slot_hook_user = nullptr;
+
+void ggml_backend_opencl_set_moe_slot_hook(ggml_opencl_moe_slot_hook_t hook, void * user_data) {
+    g_moe_slot_hook      = hook;
+    g_moe_slot_hook_user = user_data;
+}
+
+bool ggml_backend_opencl_set_expert_slice(ggml_tensor * tensor, int slot, const void * data, size_t size) {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->extra == nullptr) {
+        return false;
+    }
+    if ((tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_1) || tensor->view_src != nullptr ||
+        !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+
+    const int64_t ne02 = tensor->ne[2];
+    if (ne02 <= 0 || slot < 0 || slot >= ne02) {
+        return false;
+    }
+
+    ggml_backend_opencl_device_context * dev_ctx =
+        (ggml_backend_opencl_device_context *) tensor->buffer->buft->device->context;
+    ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
+
+    // The convert kernels address the expert dimension as a whole multiple of the per-slice size
+    // and never read ne02 itself, so pointing them at sub-buffers that begin at the destination
+    // slot and dispatching a depth of one converts exactly that slice.
+    //
+    // Sizes are derived here rather than read from the extra: the SoA upload paths compute them
+    // locally and do not all write them back, so extra->size_q can still be zero on a tensor that
+    // was fully uploaded. The component order matches the kernels' argument order.
+    const size_t n_blocks  = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+    const size_t slice_src = ggml_nbytes(tensor) / ne02;
+    const size_t slice_qs  = n_blocks * ggml_blck_size(tensor->type) / 2 / ne02;
+    const size_t slice_h   = n_blocks * sizeof(ggml_fp16_t) / ne02;
+    if (size != slice_src) {
+        return false;
+    }
+
+    cl_mem comp[3]        = { NULL, NULL, NULL };
+    size_t comp_slice[3]  = { 0, 0, 0 };
+    int    n_comp         = 0;
+
+    if (tensor->type == GGML_TYPE_Q4_0) {
+        ggml_tensor_extra_cl_q4_0 * e = (ggml_tensor_extra_cl_q4_0 *) tensor->extra;
+        if (!e->q || !e->d) return false;
+        comp[0] = e->q; comp_slice[0] = slice_qs;
+        comp[1] = e->d; comp_slice[1] = slice_h;
+        n_comp = 2;
+    } else {
+        ggml_tensor_extra_cl_q4_1 * e = (ggml_tensor_extra_cl_q4_1 *) tensor->extra;
+        if (!e->q || !e->d || !e->m) return false;
+        comp[0] = e->q; comp_slice[0] = slice_qs;
+        comp[1] = e->d; comp_slice[1] = slice_h;
+        comp[2] = e->m; comp_slice[2] = slice_h;
+        n_comp = 3;
+    }
+
+    cl_mem parent[3] = { NULL, NULL, NULL };
+    size_t origin[3] = { 0, 0, 0 };
+    for (int c = 0; c < n_comp; ++c) {
+        CL_CHECK(clGetMemObjectInfo(comp[c], CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(cl_mem), &parent[c], NULL));
+        CL_CHECK(clGetMemObjectInfo(comp[c], CL_MEM_OFFSET, sizeof(size_t), &origin[c], NULL));
+        if (parent[c] == NULL) {
+            return false;
+        }
+        // A sub-buffer origin below the device alignment is not expressible, and silently writing
+        // to a rounded origin would corrupt a neighbouring slot.
+        origin[c] += (size_t) slot * comp_slice[c];
+        if (origin[c] % backend_ctx->alignment != 0) {
+            return false;
+        }
+    }
+
+    cl_context       context = backend_ctx->context;
+    cl_command_queue queue   = backend_ctx->queue;
+
+    cl_mem stage = ggml_cl_expert_stage(context, slice_src);
+    CL_CHECK(clEnqueueWriteBuffer(queue, stage, CL_TRUE, 0, slice_src, data, 0, NULL, NULL));
+
+    cl_int err;
+    cl_mem slot_mem[3] = { NULL, NULL, NULL };
+    for (int c = 0; c < n_comp; ++c) {
+        cl_buffer_region region = { origin[c], comp_slice[c] };
+        slot_mem[c] = clCreateSubBuffer(parent[c], CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+    }
+
+    const int ne00 = tensor->ne[0];
+    const int ne01 = tensor->ne[1];
+    const bool q4_0 = tensor->type == GGML_TYPE_Q4_0;
+
+    size_t global_work_size[3];
+    size_t local_work_size[3];
+    cl_kernel kernel;
+    int argi = 0;
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (use_adreno_moe_kernels(backend_ctx, tensor)) {
+        kernel = q4_0 ? backend_ctx->kernel_convert_block_q4_0_trans4_ns
+                      : backend_ctx->kernel_convert_block_q4_1_trans4_ns;
+        CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(cl_mem), &stage));
+        for (int c = 0; c < n_comp; ++c) {
+            CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(cl_mem), &slot_mem[c]));
+        }
+        CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(int), &ne00));
+        CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(int), &ne01));
+
+        global_work_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
+        global_work_size[1] = static_cast<size_t>(ne00 / 32);
+        global_work_size[2] = 1;
+        local_work_size[0]  = 64;
+        local_work_size[1]  = 2;
+        local_work_size[2]  = 1;
+    } else
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+    {
+        kernel = q4_0 ? backend_ctx->kernel_convert_block_q4_0 : backend_ctx->kernel_convert_block_q4_1;
+        CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(cl_mem), &stage));
+        for (int c = 0; c < n_comp; ++c) {
+            CL_CHECK(clSetKernelArg(kernel, argi++, sizeof(cl_mem), &slot_mem[c]));
+        }
+
+        global_work_size[0] = (size_t) (ggml_nelements(tensor) / ne02) / ggml_blck_size(tensor->type);
+        global_work_size[1] = 1;
+        global_work_size[2] = 1;
+        local_work_size[0]  = 64;
+        local_work_size[1]  = 1;
+        local_work_size[2]  = 1;
+    }
+
+    cl_event evt;
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+    CL_CHECK(clWaitForEvents(1, &evt));
+    CL_CHECK(clReleaseEvent(evt));
+    for (int c = 0; c < n_comp; ++c) {
+        CL_CHECK(clReleaseMemObject(slot_mem[c]));
+    }
+
+    return true;
+}
+
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
@@ -19464,6 +19631,19 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     const ggml_tensor * src2 = dst->src[2];
     GGML_ASSERT(src2);
     GGML_ASSERT(src2->extra);
+
+    // An external engine may keep only a few experts resident and route the dispatch at its own
+    // pool instead. Substituting here, before any extra or shape is read, keeps ne02 consistent
+    // with the ids that come back.
+    if (g_moe_slot_hook != nullptr) {
+        ggml_opencl_moe_slots slots = { nullptr, nullptr };
+        if (g_moe_slot_hook(src0, src2, &slots, g_moe_slot_hook_user)) {
+            GGML_ASSERT(slots.weights && slots.weights->extra);
+            GGML_ASSERT(slots.ids && slots.ids->extra);
+            src0 = slots.weights;
+            src2 = slots.ids;
+        }
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
