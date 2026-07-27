@@ -1051,6 +1051,27 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+// The routed-expert weight tensors, i.e. the 3-D ones whose dim 2 indexes the expert. Matched by
+// name because that is what the gguf gives every architecture in common; the per-expert companions
+// (scales and biases) are deliberately not matched, since only the weights are large enough to be
+// worth holding in a pool.
+static bool is_moe_expert_tensor_name(const char * name) {
+    static const char * const suffixes[] = {
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+        "ffn_gate_up_exps.weight",
+    };
+    const size_t len = strlen(name);
+    for (const char * suffix : suffixes) {
+        const size_t slen = strlen(suffix);
+        if (len >= slen && strcmp(name + len - slen, suffix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1281,8 +1302,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
-    ggml_set_name(tensor, ggml_get_name(cur));
+    // A routed-expert tensor may be allocated as a residency pool holding fewer experts than the
+    // file does. The shape check above still runs against the gguf, so this narrows a tensor that
+    // was already validated rather than accepting a mismatched one. The router keeps the full
+    // expert count, so whatever selects experts must map ids into [0, moe_expert_slots) before the
+    // matmul reads them.
+    //
+    // Loading is left alone: the copy is sized from the narrowed tensor, so it reads the file's
+    // first moe_expert_slots experts and stops. That seeds the pool with valid weights and, on a
+    // device backend, is also what builds the quantized layout a later per-slice write addresses.
+    struct ggml_tensor * tensor = nullptr;
+    if (moe_expert_slots > 0 && !duplicated && ggml_n_dims(cur) == 3 &&
+        cur->ne[2] > moe_expert_slots && is_moe_expert_tensor_name(ggml_get_name(cur))) {
+        tensor = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], moe_expert_slots);
+        ggml_set_name(tensor, ggml_get_name(cur));
+    } else {
+        tensor = ggml_dup_tensor(ctx, cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1533,6 +1570,7 @@ bool llama_model_loader::load_all_data(
             // this can happen with split experts models
             continue;
         }
+
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {

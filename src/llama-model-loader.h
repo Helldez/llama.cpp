@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -101,6 +102,12 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // When > 0, routed-expert weight tensors are allocated with this many experts along dim 2
+    // instead of the gguf's n_expert: they become a residency pool that an external engine refills
+    // a slice at a time, seeded at load with the file's first this-many experts. Set by the caller
+    // after construction; 0 leaves loading unchanged.
+    int32_t moe_expert_slots = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

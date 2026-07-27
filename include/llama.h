@@ -319,6 +319,13 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // Allocate routed-expert weight tensors with this many experts instead of the file's
+        // n_expert, and leave their data unread at load time, turning them into a residency pool
+        // an external engine fills a slice at a time. The router keeps the full expert count, so
+        // the caller must map expert ids into [0, moe_expert_slots) before the matmul reads them.
+        // 0 (the default) loads experts normally.
+        int32_t moe_expert_slots;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
