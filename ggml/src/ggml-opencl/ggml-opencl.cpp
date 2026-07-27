@@ -7320,6 +7320,8 @@ static void ggml_cl_map_copy(ggml_backend_opencl_context * backend_ctx,
                              cl_mem mem, size_t offset, size_t size,
                              void * host, bool device_to_host) {
     cl_int err;
+    // Blocking map: it waits for the work already queued and hands back a pointer whose contents
+    // are valid, which is exactly the guarantee clEnqueueWriteBuffer/ReadBuffer gave before.
     void * p = clEnqueueMapBuffer(backend_ctx->queue, mem, CL_TRUE,
                                   device_to_host ? CL_MAP_READ : CL_MAP_WRITE,
                                   offset, size, 0, NULL, NULL, &err);
@@ -7329,8 +7331,11 @@ static void ggml_cl_map_copy(ggml_backend_opencl_context * backend_ctx,
     } else {
         memcpy(p, host, size);
     }
+    // No clFinish here, deliberately. The queue is in-order, so the unmap is sequenced before any
+    // kernel enqueued after it and the data is visible without draining. Waiting would cost a full
+    // pipeline flush per copy — and a partially offloaded MoE crosses the device boundary ~96 times
+    // per token, which is precisely the synchronisation this change exists to avoid paying.
     CL_CHECK(clEnqueueUnmapMemObject(backend_ctx->queue, mem, p, 0, NULL, NULL));
-    CL_CHECK(clFinish(backend_ctx->queue));
 }
 
 // Move a tensor between a host buffer and this one without the get+set round trip the generic
