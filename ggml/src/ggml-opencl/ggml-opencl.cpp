@@ -7322,8 +7322,13 @@ static void ggml_cl_map_copy(ggml_backend_opencl_context * backend_ctx,
     cl_int err;
     // Blocking map: it waits for the work already queued and hands back a pointer whose contents
     // are valid, which is exactly the guarantee clEnqueueWriteBuffer/ReadBuffer gave before.
-    void * p = clEnqueueMapBuffer(backend_ctx->queue, mem, CL_TRUE,
-                                  device_to_host ? CL_MAP_READ : CL_MAP_WRITE,
+    //
+    // The write direction asks for WRITE_INVALIDATE_REGION rather than WRITE because the caller
+    // overwrites the whole region: plain CL_MAP_WRITE obliges the driver to first make the region's
+    // CURRENT contents visible to the host, which on a non-unified device is a device->host copy
+    // of bytes that are about to be discarded.
+    const cl_map_flags map_flags = device_to_host ? CL_MAP_READ : CL_MAP_WRITE_INVALIDATE_REGION;
+    void * p = clEnqueueMapBuffer(backend_ctx->queue, mem, CL_TRUE, map_flags,
                                   offset, size, 0, NULL, NULL, &err);
     CL_CHECK(err);
     if (device_to_host) {
@@ -7338,35 +7343,11 @@ static void ggml_cl_map_copy(ggml_backend_opencl_context * backend_ctx,
     CL_CHECK(clEnqueueUnmapMemObject(backend_ctx->queue, mem, p, 0, NULL, NULL));
 }
 
-// Move a tensor between a host buffer and this one without the get+set round trip the generic
-// path would otherwise take (two copies through a bounce allocation). This is what a graph split
-// costs: with the dense path on the GPU and the routed experts on the CPU, a MoE crosses the
-// device boundary twice per layer, so the copy at that boundary is paid ~96 times per token.
-//
-// Quantized tensors are deliberately excluded: their device layout is not the row-major gguf one
-// (set_tensor de-interleaves them into separate quant/scale regions recorded in ->extra), so a
-// flat byte copy would be wrong. Activations, which are what actually cross a split, are not
-// quantized.
-static bool ggml_backend_opencl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
-                                                  const ggml_tensor * src, ggml_tensor * dst) {
-    if (!src->buffer || !ggml_backend_buffer_is_host(src->buffer)) {
-        return false; // device-to-device: the generic path knows how to sequence it, we do not
-    }
-    if (ggml_is_quantized(dst->type) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
-        return false;
-    }
-
-    ggml_backend_opencl_device_context * dev_ctx =
-        (ggml_backend_opencl_device_context *) buffer->buft->device->context;
-    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) dst->extra;
-    if (!extra) {
-        return false;
-    }
-
-    ggml_cl_map_copy(dev_ctx->backend_ctx, extra->data_device, extra->offset + dst->view_offs,
-                     ggml_nbytes(dst), src->data, /*device_to_host=*/false);
-    return true;
-}
+// NOTE on cpy_tensor: it stays NULL on purpose. ggml_backend_tensor_copy only reaches it when
+// NEITHER side is a host buffer — a host source takes tensor_set and a host destination takes
+// tensor_get, both patched above. So a cpy_tensor written for the CPU<->OpenCL direction, which is
+// the one a graph split actually uses, could never fire. Device-to-device is multi-GPU territory
+// and the generic path already sequences it.
 
 static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
@@ -9999,7 +9980,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
     /* .get_tensor_2d   = */ NULL,
-    /* .cpy_tensor      = */ ggml_backend_opencl_buffer_cpy_tensor,
+    /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
 };
