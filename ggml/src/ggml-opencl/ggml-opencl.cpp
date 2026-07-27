@@ -541,6 +541,13 @@ struct ggml_backend_opencl_context {
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
+
+    // Allocate device buffers with CL_MEM_ALLOC_HOST_PTR so host access can go through
+    // clEnqueueMapBuffer instead of a copy. On an SoC where the CPU and the GPU are the same
+    // physical DRAM this turns every host<->device transfer into a pointer hand-off; on a
+    // discrete GPU it would force the allocation into pinned host memory, which is why this is
+    // enabled only when the device reports unified memory. See issue #5965.
+    bool use_host_ptr;
     bool adreno_use_bin_kernels;
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
@@ -5528,6 +5535,19 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->adreno_use_large_buffer = getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") != nullptr &&
                                            backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
 
+    // Unified-memory zero copy. Default follows what the driver reports, because allocating with
+    // CL_MEM_ALLOC_HOST_PTR is only free when there is one physical memory: on a discrete GPU it
+    // would pin the allocation in host memory and make every kernel read cross the bus.
+    // GGML_OPENCL_HOST_PTR forces it either way (1/0) for A/B testing.
+    {
+        cl_bool unified = CL_FALSE;
+        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+        const char * env = getenv("GGML_OPENCL_HOST_PTR");
+        backend_ctx->use_host_ptr = env ? (atoi(env) != 0) : (unified == CL_TRUE);
+        GGML_LOG_INFO("ggml_opencl: unified memory: %s, host-ptr buffers: %s\n",
+                      unified ? "yes" : "no", backend_ctx->use_host_ptr ? "on" : "off");
+    }
+
     // ragged moe, unspecified or non-zero means enabled, set to 0 to disable
     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
     backend_ctx->adreno_use_moe_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
@@ -7291,6 +7311,58 @@ static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer)
     delete ctx;
 }
 
+// Copy `size` bytes between host memory and a region of a device buffer, through a map rather
+// than an enqueued transfer. On a unified-memory SoC the map is a pointer hand-off, so this is
+// one memcpy instead of a driver copy; on a device without CL_MEM_ALLOC_HOST_PTR the driver
+// still does the right thing, only without the saving. Blocking on purpose: callers of
+// set_tensor/get_tensor/cpy_tensor expect the data to be there on return.
+static void ggml_cl_map_copy(ggml_backend_opencl_context * backend_ctx,
+                             cl_mem mem, size_t offset, size_t size,
+                             void * host, bool device_to_host) {
+    cl_int err;
+    void * p = clEnqueueMapBuffer(backend_ctx->queue, mem, CL_TRUE,
+                                  device_to_host ? CL_MAP_READ : CL_MAP_WRITE,
+                                  offset, size, 0, NULL, NULL, &err);
+    CL_CHECK(err);
+    if (device_to_host) {
+        memcpy(host, p, size);
+    } else {
+        memcpy(p, host, size);
+    }
+    CL_CHECK(clEnqueueUnmapMemObject(backend_ctx->queue, mem, p, 0, NULL, NULL));
+    CL_CHECK(clFinish(backend_ctx->queue));
+}
+
+// Move a tensor between a host buffer and this one without the get+set round trip the generic
+// path would otherwise take (two copies through a bounce allocation). This is what a graph split
+// costs: with the dense path on the GPU and the routed experts on the CPU, a MoE crosses the
+// device boundary twice per layer, so the copy at that boundary is paid ~96 times per token.
+//
+// Quantized tensors are deliberately excluded: their device layout is not the row-major gguf one
+// (set_tensor de-interleaves them into separate quant/scale regions recorded in ->extra), so a
+// flat byte copy would be wrong. Activations, which are what actually cross a split, are not
+// quantized.
+static bool ggml_backend_opencl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                                  const ggml_tensor * src, ggml_tensor * dst) {
+    if (!src->buffer || !ggml_backend_buffer_is_host(src->buffer)) {
+        return false; // device-to-device: the generic path knows how to sequence it, we do not
+    }
+    if (ggml_is_quantized(dst->type) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    ggml_backend_opencl_device_context * dev_ctx =
+        (ggml_backend_opencl_device_context *) buffer->buft->device->context;
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) dst->extra;
+    if (!extra) {
+        return false;
+    }
+
+    ggml_cl_map_copy(dev_ctx->backend_ctx, extra->data_device, extra->offset + dst->view_offs,
+                     ggml_nbytes(dst), src->data, /*device_to_host=*/false);
+    return true;
+}
+
 static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     return (void *) (uintptr_t) dev_ctx->backend_ctx->alignment;
@@ -8791,11 +8863,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
-    CL_CHECK(clEnqueueWriteBuffer(
-        queue, extra->data_device, CL_TRUE, extra->offset + offset,
-        size, data, 0, NULL, NULL));
+    // The unquantized upload — activations entering the GPU section of a split graph. Through a
+    // map, so a unified-memory device does not copy what it already shares.
+    ggml_cl_map_copy(backend_ctx, extra->data_device, extra->offset + offset, size,
+                     const_cast<void *>(data), /*device_to_host=*/false);
 
     GGML_UNUSED(buffer);
+    GGML_UNUSED(queue);
 }
 
 static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -9884,11 +9958,13 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
 
-    CL_CHECK(clEnqueueReadBuffer(
-        queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
-        size, data, 0, NULL, NULL));
+    // The unquantized readback — logits, and the activations handed back to the CPU at a graph
+    // split. Through a map, so a unified-memory device does not copy what it already shares.
+    ggml_cl_map_copy(backend_ctx, extra->data_device, extra->offset + tensor->view_offs + offset,
+                     size, data, /*device_to_host=*/true);
 
     GGML_UNUSED(buffer);
+    GGML_UNUSED(queue);
 }
 
 static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -9918,7 +9994,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
     /* .get_tensor_2d   = */ NULL,
-    /* .cpy_tensor      = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_opencl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
 };
@@ -9941,10 +10017,12 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     size = std::max(size, (size_t)1);
 
     cl_int err;
-    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    const cl_mem_flags flags =
+        CL_MEM_READ_WRITE | (backend_ctx->use_host_ptr ? CL_MEM_ALLOC_HOST_PTR : (cl_mem_flags) 0);
+    cl_mem mem = clCreateBuffer(backend_ctx->context, flags, size, NULL, &err);
     if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
-        mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
+        mem = clCreateBufferWithProperties(backend_ctx->context, props, flags, size, NULL, &err);
     }
 
     if (err != CL_SUCCESS) {
