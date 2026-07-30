@@ -150,6 +150,32 @@ extern "C" {
     // respect to concurrent graph computation - register before compute starts.
     GGML_BACKEND_API void ggml_cpu_set_expert_ready_hook(ggml_cpu_expert_ready_hook_t hook, void * user_data);
 
+    // Row-sparse expert up-projection (EXPERIMENTAL - a measurement, not a feature).
+    //
+    // stride > 1 makes mul_mat_id evaluate only every stride-th OUTPUT row of the expert
+    // up-projection ("ffn_moe_up*" nodes), writing 0.0f for the rest; stride 0 evaluates
+    // none of them at all. A power of two (values in between are rounded down), so the test
+    // is a single AND and the measurement is not eating its own saving. It exists
+    // to price a row-sparse expert matmul before one is built: a matmul's cost depends on
+    // HOW MANY rows are computed, not on which, so the wall-clock saving measured here is
+    // the real one - but the kept rows are chosen by a fixed stride rather than by
+    // activation magnitude, so the NUMERICS ARE DELIBERATELY WRONG and no output produced
+    // with this enabled means anything.
+    //
+    // Only the up-projection is offered, and that is a property of the weight layout, not
+    // an omission: ffn_up_exps is {n_embd, n_ff, n_expert}, so a neuron is a whole output
+    // row spanning an integer number of quantization blocks and can be skipped cleanly.
+    // ffn_down_exps is {n_ff, n_embd, n_expert}, where the same neurons are scattered
+    // positions inside every block along the reduction axis - nothing there is skippable
+    // without dequantizing the block anyway.
+    //
+    // stride 0 is not a usable configuration but it IS the asymptote: it reports what the
+    // whole up-projection costs, which bounds anything row sparsity could ever return here.
+    //
+    // 1 = off, which costs one integer compare per chunk. Process-global; set before
+    // compute starts.
+    GGML_BACKEND_API void ggml_cpu_set_expert_row_stride(int stride);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);

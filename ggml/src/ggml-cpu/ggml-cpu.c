@@ -65,6 +65,26 @@ void ggml_cpu_set_expert_ready_hook(ggml_cpu_expert_ready_hook_t hook, void * us
     g_expert_ready_hook_data = user_data;
 }
 
+// Row-sparse expert up-projection, for measurement only. See ggml-cpu.h.
+//
+// Held as a power-of-two stride, not a percentage: the test then costs one AND on a loop that IS
+// the matmul, so what the measurement reports is the saving from not doing the dot product rather
+// than that saving minus the arithmetic of deciding. 1 = every row (off), 2 = every other, 4 = one
+// in four, ... and 0 = none at all, which is not a useful configuration but IS the asymptote: it
+// says what the whole up-projection costs, which bounds everything this idea could ever return.
+static int g_expert_row_stride = 1;
+
+void ggml_cpu_set_expert_row_stride(int stride) {
+    if (stride < 0) { stride = 0; }
+    // Round down to a power of two so the mask below is exact.
+    if (stride > 1) {
+        int p = 1;
+        while (p * 2 <= stride) { p *= 2; }
+        stride = p;
+    }
+    g_expert_row_stride = stride;
+}
+
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
@@ -1485,7 +1505,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const int row_stride) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1525,6 +1546,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                    // Row-sparse measurement: a strided subset stands in for the rows a
+                    // magnitude threshold would keep. The dot product is the whole cost, so
+                    // skipping it here is exactly what a real row-sparse kernel would save --
+                    // and the test is one AND, so almost none of the saving is spent deciding.
+                    if (row_stride != 1 && (row_stride == 0 || (ir0 & (row_stride - 1)) != 0)) {
+                        tmp[ir0 - iir0] = 0.0f;
+                        continue;
+                    }
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
@@ -1558,6 +1587,12 @@ static void ggml_compute_forward_mul_mat_id(
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
+
+    // Row-sparse measurement (see ggml-cpu.h). Decided once per node: the up-projection is
+    // the only one whose neurons are whole output rows, so it is the only one offered.
+    const int row_stride = (g_expert_row_stride != 1 && strncmp(dst->name, "ffn_moe_up", 10) == 0)
+        ? g_expert_row_stride
+        : 1;
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
@@ -1711,7 +1746,8 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata,
+                row_stride
             );
 
             if (nth >= nchunk0 * nchunk1) {
