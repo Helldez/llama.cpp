@@ -1168,6 +1168,15 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // [EXPERIMENTAL] The slot map of the MoE cache (see moe_cache_size) for layer il: one int32 per expert, in host
+    // memory, the expert's slot on the device or -1 if it is not there. Returns NULL unless a batch of n_tokens tokens
+    // that selects n_expert_used experts per token reads the experts of layer il from the cache.
+    // Meant for the eval callback, between the node that selects the experts of layer il and the cache's lookup:
+    // an expert the batch selects that has a slot then is not evicted by that layer's uploads, so its host weights
+    // are not read for this batch. The map changes as later layers upload their experts.
+    #define LLAMA_HAS_MOE_CACHE_SLOTS 1
+    LLAMA_API const int32_t * llama_moe_cache_slots(struct llama_context * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

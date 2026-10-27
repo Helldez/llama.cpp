@@ -2775,6 +2775,10 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+const int32_t * llama_context::moe_cache_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return moe_cache ? moe_cache->get_slots(il, n_tokens, n_expert_used) : nullptr;
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
@@ -4267,6 +4271,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+const int32_t * llama_moe_cache_slots(llama_context * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used) {
+    return ctx->moe_cache_slots(il, n_tokens, n_expert_used);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
