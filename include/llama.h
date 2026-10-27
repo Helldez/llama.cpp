@@ -397,6 +397,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        int32_t moe_cache_cpu; // experts missing from the MoE cache: -1 = uploaded, N >= 0 = computed on the CPU, at most N of them per layer and batch still uploaded for later batches [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1175,6 +1176,7 @@ extern "C" {
     // an expert the batch selects that has a slot then is not evicted by that layer's uploads, so its host weights
     // are not read for this batch. The map changes as later layers upload their experts.
     #define LLAMA_HAS_MOE_CACHE_SLOTS 1
+    #define LLAMA_HAS_MOE_CACHE_CPU   1 // llama_context_params::moe_cache_cpu
     LLAMA_API const int32_t * llama_moe_cache_slots(struct llama_context * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used);
 
     //

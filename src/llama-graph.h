@@ -1114,12 +1114,14 @@ struct llm_graph_context {
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if backend is set, the mat_mul_id runs on it
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+           ggml_backend_t   backend = nullptr) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1225,14 +1227,23 @@ struct llm_graph_context {
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
+    // the experts missing from the MoE cache, computed on the CPU (see llama_moe_cache::get_cpu_maps)
+    struct moe_cache_cpu {
+        ggml_tensor * cpu_ids  = nullptr; // [n_expert_used, n_tokens], -1 for the experts in the cache
+        ggml_tensor * dev_mask = nullptr; // [1, n_expert_used, n_tokens]
+        ggml_tensor * cpu_mask = nullptr; // [1, n_expert_used, n_tokens]
+    };
+
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    // if the cache computes its missing experts on the CPU, cpu receives their lookups, or the cache is not used if cpu is nullptr
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
-                     int   il) const;
+                     int   il,
+           moe_cache_cpu * cpu) const;
 
     //
     // inputs
