@@ -22,6 +22,10 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
+    // the data of the slot map of layer il if the graph reads its experts from the cache for n_tokens tokens, nullptr otherwise
+    // an expert selected by the batch that has a slot here when the layer's lookup starts keeps it through that layer's plan
+    const int32_t * get_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
 

@@ -252,6 +252,9 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // the lookup that get_slots checks with the backend
+    mutable std::vector<uint8_t> lookup_mem;
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -506,6 +509,27 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    // the same conditions as build_moe_cache_slots, which falls back to the host experts if the device cannot look up the slots
+    const int32_t * get_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+        ggml_tensor * slot_map = get_slot_map(il, n_tokens, n_expert_used);
+        if (slot_map == nullptr) {
+            return nullptr;
+        }
+        lookup_mem.resize(2*ggml_tensor_overhead());
+        ggml_init_params params = {
+            /*.mem_size   =*/ lookup_mem.size(),
+            /*.mem_buffer =*/ lookup_mem.data(),
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_tokens*n_expert_used);
+        ggml_tensor * slots = ggml_get_rows(ctx.get(), slot_map, ids);
+        if (!ggml_backend_supports_op(backend(il), slots)) {
+            return nullptr;
+        }
+        return groups[layers[il].ig].slru.slot_map[il];
+    }
+
     ggml_tensor * get_experts(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
@@ -645,6 +669,10 @@ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
     return pimpl->get_slot_map(il, n_tokens, n_expert_used);
+}
+
+const int32_t * llama_moe_cache::get_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_slots(il, n_tokens, n_expert_used);
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {

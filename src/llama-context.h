@@ -262,6 +262,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    const int32_t * moe_cache_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
 private:
     llm_graph_result * get_gf_res_prev();
 
