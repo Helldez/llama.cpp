@@ -13,7 +13,8 @@ struct llama_model;
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    // cpu >= 0 computes the missing experts on the CPU and uploads at most cpu of them per layer and batch, see get_cpu_maps
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int32_t cpu = -1);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -25,6 +26,11 @@ public:
     // the data of the slot map of layer il if the graph reads its experts from the cache for n_tokens tokens, nullptr otherwise
     // an expert selected by the batch that has a slot here when the layer's lookup starts keeps it through that layer's plan
     const int32_t * get_slots(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // if the missing experts are computed on the CPU, the maps of layer il, looked up like the slot map:
+    // I32 cpu_ids (the expert, -1 if it is in the cache), F32 dev_mask (1 if it is in the cache) and cpu_mask (1 - dev_mask)
+    // the slot map then gives slot 0 to the missing experts, so the device computes them with any weights and dev_mask drops them
+    bool get_cpu_maps(int32_t il, ggml_tensor ** cpu_ids, ggml_tensor ** dev_mask, ggml_tensor ** cpu_mask) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
