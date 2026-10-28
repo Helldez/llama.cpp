@@ -28,6 +28,12 @@ struct moe_cache_slru {
     std::vector<bool> is_protected;
     int32_t n_protected = 0;
 
+    // how often each expert of each layer was selected, halved every sample_size selections (TinyLFU),
+    // so that with a limit on the uploads the cache admits an expert only over a less used one
+    std::vector<uint16_t> freq; // [n_layer*n_expert]
+    uint64_t n_selected  = 0;
+    uint64_t sample_size = 0;
+
     std::vector<uint32_t> seen; // [n_expert]
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
@@ -47,6 +53,8 @@ struct moe_cache_slru {
         head[0] = 0;
         tail[0] = n_slots - 1;
         is_protected.assign(n_slots, false);
+        freq.assign((size_t) n_layer*n_expert, 0);
+        sample_size = 10*(uint64_t) n_slots;
         seen.assign(n_expert, 0);
     }
 
@@ -127,6 +135,18 @@ struct moe_cache_slru {
         }
         n_uniq = uniq.size();
 
+        for (int32_t e : uniq) {
+            uint16_t & f = freq[(size_t) il*n_expert + e];
+            f += f < UINT16_MAX;
+        }
+        n_selected += uniq.size();
+        if (n_selected >= sample_size) {
+            for (uint16_t & f : freq) {
+                f /= 2;
+            }
+            n_selected = 0;
+        }
+
         int32_t * slots = slot_map[il];
 
         // promote hits before choosing victims for misses
@@ -136,27 +156,46 @@ struct moe_cache_slru {
                 n_hit++;
             }
         }
-        // the ids of a token come by score, so the limit keeps the best scored misses of the first tokens
+        // with a limit, the most used misses are uploaded, each only over a victim used less than it
         if (max_fills >= 0) {
             uniq.erase(std::remove_if(uniq.begin(), uniq.end(), [&](int32_t e) { return slots[e] >= 0; }), uniq.end());
-            uniq.resize(std::min(uniq.size(), (size_t) max_fills));
+            const uint16_t * f = &freq[(size_t) il*n_expert];
+            std::stable_sort(uniq.begin(), uniq.end(), [&](int32_t a, int32_t b) { return f[a] > f[b]; });
+            size_t n_admit = 0;
+            for (int32_t e : uniq) {
+                if (n_admit == (size_t) max_fills) {
+                    break;
+                }
+                const int32_t key = key_of[victim(il)];
+                if (key >= 0 && freq[key] >= f[e]) {
+                    break;
+                }
+                admit(il, e, fills);
+                n_admit++;
+            }
+            std::sort(fills.begin(), fills.end(), [](const fill & a, const fill & b) { return a.expert < b.expert; });
+            return true;
         }
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(uniq.begin(), uniq.end());
         for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                continue;
+            if (slots[e] < 0) {
+                admit(il, e, fills);
             }
-            const int32_t s = victim(il);
-            if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
-            }
-            key_of[s] = il*n_expert + e;
-            slots[e] = s;
-            move(s, false);
-            fills.push_back({ e, s });
         }
         return true;
+    }
+
+    // give expert e of layer il the victim's slot
+    void admit(int32_t il, int32_t e, std::vector<fill> & fills) {
+        const int32_t s = victim(il);
+        if (key_of[s] >= 0) {
+            slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+        }
+        key_of[s] = il*n_expert + e;
+        slot_map[il][e] = s;
+        move(s, false);
+        fills.push_back({ e, s });
     }
 };
 
