@@ -765,9 +765,11 @@ struct llama_moe_cache::impl {
                 d.prefetch      = ggml_backend_dev_init(dev, nullptr);
                 d.prefetch_done = d.prefetch ? ggml_backend_event_new(dev) : nullptr;
             }
+            // per layer of the graph: a layer that runs another layer's experts predicts and is predicted on its own
             int32_t prev = -1;
             for (size_t il = 0; il < model.layers.size(); ++il) {
-                const bool cached = std::any_of(groups.begin(), groups.end(), [&](const group & g) { return std::find(g.layers.begin(), g.layers.end(), (int32_t) il) != g.layers.end(); });
+                const int32_t ic = canon((int32_t) il);
+                const bool cached = std::any_of(groups.begin(), groups.end(), [&](const group & g) { return std::find(g.layers.begin(), g.layers.end(), ic) != g.layers.end(); });
                 if (!cached) {
                     continue;
                 }
@@ -1181,19 +1183,21 @@ struct llama_moe_cache::impl {
         const int32_t il      = canon(it->second.first);
         const bool    has_cpu = it->second.second;
         layer & l = layers[il];
+        // the prediction and the read-ahead belong to this layer of the graph, the slots to the layer it reads them from
+        layer & lo = layers[it->second.first];
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
 
         device & dv = devices[g.id];
         const auto tc0 = std::chrono::steady_clock::now();
-        if (l.prefetched) {
+        if (lo.prefetched) {
             if (direct(g)) {
                 fill(nullptr, 0, false); // the predicted experts of this layer are in their slots
             } else {
                 ggml_backend_event_wait(backend, dv.prefetch_done);
             }
-            l.prefetched = false;
+            lo.prefetched = false;
         }
 
         // the get_rows that looks up the slots of the selected experts
@@ -1223,18 +1227,18 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         std::vector<int32_t> pred_next;
-        const bool want_pred = l.pred != nullptr && l.next >= 0;
+        const bool want_pred = lo.pred != nullptr && lo.next >= 0;
         if (want_pred) {
-            pred_logits.resize(ggml_nelements(l.pred));
+            pred_logits.resize(ggml_nelements(lo.pred));
         }
         // where the host addresses the memory, the results are read in place once the device is idle; else queued copies
         const void * sel_host  = ggml_backend_tensor_host_ptr(sel);
-        const void * pred_host = want_pred ? ggml_backend_tensor_host_ptr(l.pred) : nullptr;
+        const void * pred_host = want_pred ? ggml_backend_tensor_host_ptr(lo.pred) : nullptr;
         if (sel_host == nullptr) {
             ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         }
         if (want_pred && pred_host == nullptr) {
-            ggml_backend_tensor_get_async(backend, l.pred, pred_logits.data(), 0, ggml_nbytes(l.pred));
+            ggml_backend_tensor_get_async(backend, lo.pred, pred_logits.data(), 0, ggml_nbytes(lo.pred));
         }
         const auto tc1 = std::chrono::steady_clock::now();
         ggml_backend_synchronize(backend);
@@ -1243,9 +1247,9 @@ struct llama_moe_cache::impl {
             memcpy(ids.data(), sel_host, ggml_nbytes(sel));
         }
         if (pred_host != nullptr) {
-            memcpy(pred_logits.data(), pred_host, ggml_nbytes(l.pred));
+            memcpy(pred_logits.data(), pred_host, ggml_nbytes(lo.pred));
         }
-        if (l.pred != nullptr && l.next >= 0) {
+        if (lo.pred != nullptr && lo.next >= 0) {
             pred_next.resize(pred_logits.size());
             for (size_t i = 0; i < pred_next.size(); ++i) {
                 pred_next[i] = (int32_t) i;
@@ -1256,10 +1260,10 @@ struct llama_moe_cache::impl {
         }
 
         // score the prediction of this layer's experts, made by the layer before, against the cache before this plan
-        if (!l.predicted.empty() && sel->src[0]->ne[1] == 1) {
+        if (!lo.predicted.empty() && sel->src[0]->ne[1] == 1) {
             const int32_t * slots_now = g.lru.slot_map[il];
             for (int32_t e : ids) {
-                const bool pred_hit = std::find(l.predicted.begin(), l.predicted.end(), e) != l.predicted.end();
+                const bool pred_hit = std::find(lo.predicted.begin(), lo.predicted.end(), e) != lo.predicted.end();
                 stats_pred.selected++;
                 stats_pred.selected_pred += pred_hit;
                 if (slots_now[e] >= g.n_slots) {
@@ -1268,17 +1272,17 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        for (int32_t e : l.prefetched_experts) {
+        for (int32_t e : lo.prefetched_experts) {
             stats_pred.prefetched_used += std::find(ids.begin(), ids.end(), e) != ids.end();
         }
-        l.prefetched_experts.clear();
-        l.predicted.clear();
+        lo.prefetched_experts.clear();
+        lo.predicted.clear();
         if (!pred_next.empty()) {
-            layers[l.next].predicted = pred_next;
-            const group & gn = groups[layers[l.next].ig];
+            layers[lo.next].predicted = pred_next;
+            const group & gn = groups[layers[lo.next].ig];
             stats_pred.layers++;
             for (int32_t e : pred_next) {
-                stats_pred.uploads += gn.lru.slot_map[l.next][e] >= gn.n_slots;
+                stats_pred.uploads += gn.lru.slot_map[canon(lo.next)][e] >= gn.n_slots;
             }
         }
 
@@ -1349,9 +1353,9 @@ struct llama_moe_cache::impl {
         }
 
         // upload the predicted experts of the next layer of the same group while this layer computes
-        if (max_prefetch > 0 && !pred_next.empty() && layers[l.next].ig == l.ig && (dv.prefetch != nullptr || direct(g))) {
-            layer & ln = layers[l.next];
-            g.lru.admit(l.next, pred_next.data(), pred_next.size(), il, max_prefetch, prefetch_fills);
+        if (max_prefetch > 0 && !pred_next.empty() && layers[lo.next].ig == l.ig && (dv.prefetch != nullptr || direct(g))) {
+            layer & ln = layers[lo.next];
+            g.lru.admit(canon(lo.next), pred_next.data(), pred_next.size(), il, max_prefetch, prefetch_fills);
             if (!prefetch_fills.empty() && direct(g)) {
                 // written while this layer computes: the victims are no slot this layer reads
                 fill_jobs.clear();
@@ -1639,12 +1643,11 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     const int32_t il = pimpl->canon(layer.il);
     ggml_context * ctx0 = g.ctx0;
 
-    // the experts of the next cached layer, predicted with its router on this layer's expert input; not where a layer's
-    // cache is run by another layer too: the prediction is kept per layer, and the second run would replace it
-    if (il >= 0 && il < (int32_t) pimpl->layers.size()) {
-        auto & l = pimpl->layers[il];
+    // the experts of the next cached layer of the graph, predicted with its router on this layer's expert input
+    if (layer.il >= 0 && layer.il < (int32_t) pimpl->layers.size()) {
+        auto & l = pimpl->layers[layer.il]; // the prediction is this layer of the graph's, not the layer whose slots it reads
         l.pred = nullptr;
-        if (l.next >= 0 && cur != nullptr && selected_experts->ne[1] == 1 && !pimpl->shared[il] && !pimpl->shared[l.next]) {
+        if (l.next >= 0 && cur != nullptr && selected_experts->ne[1] == 1) {
             ggml_tensor * router = pimpl->layers[l.next].router;
             // the host ranks the logits while it plans the lookup: a sort on the device costs more than the matmul
             ggml_tensor * logits = ggml_mul_mat(ctx0, router, ggml_reshape_2d(ctx0, cur, cur->ne[0], ggml_nelements(cur)/cur->ne[0]));
@@ -1693,7 +1696,7 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     // with a CPU worker the misses left to the host are computed inside the graph too (see build_experts)
     const bool side = use_host_call && cpu_map != nullptr && pimpl->cpu_backend != nullptr && cur != nullptr;
     ggml_tensor * cpu_in = nullptr;
-    if (use_host_call && (cpu_map == nullptr || side) && pimpl->layers[il].pred == nullptr) {
+    if (use_host_call && (cpu_map == nullptr || side) && pimpl->layers[layer.il].pred == nullptr) {
         cpu_in = side ? (ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur)) : nullptr;
         slots = ggml_host_call_2(ctx0, ids, cpu_in, GGML_TYPE_I32, ggml_nelements(ids), 1, &impl::host_call, &pimpl->layers[il]);
         if (!ggml_backend_supports_op(pimpl->backend(il), slots)) {
