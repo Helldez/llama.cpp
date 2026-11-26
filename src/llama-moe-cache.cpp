@@ -631,6 +631,15 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // twins of the experts that layers share (see llama_moe_cache::twin): headers only, over the experts' bytes
+    ggml_context_ptr ctx_twins;
+    std::map<std::pair<int32_t, const ggml_tensor *>, ggml_tensor *> twins; // (layer, experts) -> twin
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> twin_of;  // twin -> experts
+    const ggml_tensor * base_of(const ggml_tensor * w) const {
+        const auto it = twin_of.find(w);
+        return it != twin_of.end() ? it->second : w;
+    }
+
     bool use_host_call = false; // the lookup is a host call where the device supports it
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
@@ -706,6 +715,31 @@ struct llama_moe_cache::impl {
             for (const ggml_tensor * t : experts) {
                 it->host_bytes         += ggml_nbytes(t);
                 devices[id].host_bytes += ggml_nbytes(t);
+            }
+        }
+        // a twin of each expert tensor a layer shares with an earlier one, for the batches the cache does not serve
+        {
+            size_t n_twins = 0;
+            for (size_t il = 0; il < alias.size(); ++il) {
+                n_twins += alias[il] >= 0 ? llama_moe_cache_layer_experts(model.layers[il]).size() : 0;
+            }
+            if (n_twins > 0) {
+                ggml_init_params ip = { n_twins*ggml_tensor_overhead(), nullptr, true };
+                ctx_twins.reset(ggml_init(ip));
+                for (size_t il = 0; il < alias.size(); ++il) {
+                    if (alias[il] < 0) {
+                        continue;
+                    }
+                    for (ggml_tensor * t : llama_moe_cache_layer_experts(model.layers[il])) {
+                        ggml_tensor * tw = ggml_dup_tensor(ctx_twins.get(), t);
+                        GGML_ASSERT(tw->nb[1] == t->nb[1] && tw->nb[2] == t->nb[2]);
+                        tw->data   = t->data;   // the same bytes; a copy reads them through experts_of at the time it is made
+                        tw->buffer = t->buffer;
+                        ggml_set_name(tw, t->name);
+                        twins[{ (int32_t) il, t }] = tw;
+                        twin_of[tw] = t;
+                    }
+                }
             }
         }
         if (opts.host_call) {
@@ -1074,7 +1108,8 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
-    bool can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const {
+    bool can_fill_experts(const ggml_tensor * w_in, const ggml_tensor * dst) const {
+        const ggml_tensor * w = base_of(w_in);
         const auto it = bindings.find(w);
         if (it == bindings.end() || !devices[groups[layers[it->second.il].ig].id].direct) {
             return false;
@@ -1082,7 +1117,8 @@ struct llama_moe_cache::impl {
         return ggml_backend_tensor_host_ptr(dst) != nullptr;
     }
 
-    void fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts) {
+    void fill_experts(ggml_backend_t backend, const ggml_tensor * w_in, ggml_tensor * dst, const std::vector<int32_t> & experts) {
+        const ggml_tensor * w = base_of(w_in);
         if (experts.empty()) {
             return;
         }
@@ -1100,7 +1136,8 @@ struct llama_moe_cache::impl {
         stats_copy.bytes  += experts.size()*expert_size;
     }
 
-    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w_in, ggml_tensor * dst, int64_t e, int64_t last) {
+        const ggml_tensor * w = base_of(w_in);
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -1733,6 +1770,15 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 bool llama_moe_cache::can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const {
     return pimpl->can_fill_experts(w, dst);
+}
+
+ggml_tensor * llama_moe_cache::twin(int32_t il, const ggml_tensor * w) const {
+    const auto it = pimpl->twins.find({ il, w });
+    return it != pimpl->twins.end() ? it->second : nullptr;
+}
+
+const ggml_tensor * llama_moe_cache::experts_of(const ggml_tensor * w) const {
+    return pimpl->base_of(w);
 }
 
 void llama_moe_cache::fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts) {

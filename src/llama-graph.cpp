@@ -2566,6 +2566,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
         moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts, cur);
 
+    // a layer that runs another layer's experts, in a batch the cache does not serve: their twin, so that the scheduler's
+    // copy lives for this layer only (see llama_moe_cache::twin); not where a LoRA or a rotation is keyed by the tensor
+    if (cache.slots == nullptr && moe_cache != nullptr && loras->empty()) {
+        for (ggml_tensor ** w : { &up_exps, &gate_exps, &down_exps, &gate_up_exps }) {
+            if (*w == nullptr || (hdmd != nullptr && hdmd->rot.count(*w) > 0)) {
+                continue;
+            }
+            if (ggml_tensor * tw = moe_cache->twin(il, *w)) {
+                *w = tw;
+            }
+        }
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {

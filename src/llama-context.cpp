@@ -3176,6 +3176,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
+    // a twin (see llama_moe_cache::twin) has the bytes of the experts it stands for, read here at the time of the copy
+    const ggml_tensor * base = lctx->moe_cache ? lctx->moe_cache->experts_of(src) : src;
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
@@ -3224,7 +3226,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         st.fill.push_back((int32_t) i);
                     }
                 } else {
-                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) base->data + next*expert_size, next*expert_size, (e - next)*expert_size);
                 }
             }
             e   += n;
@@ -3244,7 +3246,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 st.fill_pad.push_back((last + 1)*expert_size);
             }
         } else if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) base->data + offset, offset, size);
         }
 
         first = last + 1;
@@ -3257,7 +3259,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         lctx->moe_cache->fill_experts(backend, src, dst, st.fill);
         uint8_t * dst_host = (uint8_t *) ggml_backend_tensor_host_ptr(dst);
         for (size_t off : st.fill_pad) {
-            memcpy(dst_host + off, (const uint8_t *) src->data + off, std::min<size_t>(expert_size, 512));
+            memcpy(dst_host + off, (const uint8_t *) base->data + off, std::min<size_t>(expert_size, 512));
         }
         st.fill_pad.clear();
     }

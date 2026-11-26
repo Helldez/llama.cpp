@@ -74,6 +74,12 @@ public:
     // not in the cache are filled straight into dst like the cache's misses (the fill function, on its lanes), instead
     // of being uploaded from w->data; false if this does not apply, and then nothing was written
     bool can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const;
+
+    // layers that run another layer's expert tensors (looped blocks, shared weights) read, in a batch the cache does not
+    // serve, a twin of each: a tensor of its own over the same bytes, so that the scheduler's copy of it lives for that
+    // layer only. twin() is nullptr for any other layer; experts_of() maps a twin back to the experts it stands for.
+    ggml_tensor * twin(int32_t il, const ggml_tensor * w) const;
+    const ggml_tensor * experts_of(const ggml_tensor * w) const;
     void fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts);
 
     // fill the misses in place with fn instead of uploading them, false if a cache buffer has no host address
