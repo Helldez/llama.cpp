@@ -1056,13 +1056,13 @@ static void * ggml_backend_cuda_buffer_get_host_base(ggml_backend_buffer_t buffe
     if (ctx->dev_ptr == nullptr || !ggml_cuda_unified_memory_enabled()) {
         return nullptr;
     }
-    int integrated = 0, concurrent = 0;
-    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, ctx->device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, ctx->device) != cudaSuccess) {
+    // the device properties, not cudaDeviceGetAttribute: HIP names these fields alike but not the attributes
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, ctx->device) != cudaSuccess) {
         (void) cudaGetLastError();
         return nullptr;
     }
-    return integrated && concurrent ? ctx->dev_ptr : nullptr;
+    return prop.integrated && prop.concurrentManagedAccess ? ctx->dev_ptr : nullptr;
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
