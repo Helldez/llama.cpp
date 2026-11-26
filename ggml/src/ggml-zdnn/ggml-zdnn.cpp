@@ -450,6 +450,7 @@ static ggml_backend_buffer_i ggml_backend_zdnn_buffer_i = {
     /* .set_tensor_n  = */ NULL,
     /* .get_tensor_n  = */ NULL,
     /* .cpy_tensor_n  = */ NULL,
+    /* .get_host_base = */ NULL,
 };
 
 //

@@ -2251,6 +2251,29 @@ void ggml_compute_forward_sleep(const ggml_compute_params * params, ggml_tensor 
     while (ggml_time_us() < t_end) {}
 }
 
+// ggml_compute_forward_host_call
+
+void ggml_compute_forward_host_call(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_host_call_op_params * p = (const ggml_host_call_op_params *) dst->op_params;
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    if (b == nullptr) {
+        p->fn(a->data, ggml_nbytes(a), dst->data, ggml_nbytes(dst), p->userdata);
+        return;
+    }
+    // the inputs one after the other, as a device backend hands them over
+    static thread_local std::vector<uint8_t> buf;
+    const size_t off = GGML_PAD(ggml_nbytes(a), 16);
+    buf.resize(off + ggml_nbytes(b));
+    memcpy(buf.data(), a->data, ggml_nbytes(a));
+    memcpy(buf.data() + off, b->data, ggml_nbytes(b));
+    p->fn(buf.data(), buf.size(), dst->data, ggml_nbytes(dst), p->userdata);
+}
+
 // ggml_compute_tri
 
 template <typename T>

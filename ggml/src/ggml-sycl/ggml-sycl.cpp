@@ -1195,6 +1195,7 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 // sycl buffer type
@@ -1706,6 +1707,7 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 // sycl split buffer type

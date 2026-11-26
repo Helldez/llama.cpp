@@ -207,6 +207,11 @@ struct ggml_map_custom3_op_params {
     void            * userdata;
 };
 
+struct ggml_host_call_op_params {
+    ggml_host_call_t fn;
+    void           * userdata;
+};
+
 struct ggml_custom_op_params {
     ggml_custom_op_t fun;
     int              n_tasks;

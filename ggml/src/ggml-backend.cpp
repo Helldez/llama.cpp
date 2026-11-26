@@ -324,6 +324,27 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+void * ggml_backend_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL || buffer->size == 0) {
+        return NULL;
+    }
+    if (buffer->iface.get_host_base != NULL) {
+        return buffer->iface.get_host_base(buffer);
+    }
+    return buffer->iface.get_base != NULL && ggml_backend_buffer_is_host(buffer) ? ggml_backend_buffer_get_base(buffer) : NULL;
+}
+
+void * ggml_backend_tensor_host_ptr(const struct ggml_tensor * tensor) {
+    const struct ggml_tensor * base = tensor->view_src ? tensor->view_src : tensor;
+    ggml_backend_buffer_t buffer = base->buffer;
+    uint8_t * host = (uint8_t *) ggml_backend_buffer_get_host_base(buffer);
+    if (host == NULL || tensor->data == NULL) {
+        return NULL;
+    }
+    // tensor data is an address in the buffer's own space (a device address for some backends): keep its offset only
+    return host + ((const uint8_t *) tensor->data - (const uint8_t *) ggml_backend_buffer_get_base(buffer));
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;
@@ -1113,6 +1134,7 @@ static const struct ggml_backend_buffer_i ggml_backend_multi_buffer_i = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers) {
@@ -2893,6 +2915,7 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_i = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
@@ -2910,6 +2933,7 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 // CPU backend buffer type

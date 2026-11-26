@@ -994,6 +994,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -3113,7 +3114,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // a host call runs a function of this process, which the remote host does not have
+    if (op->op == GGML_OP_HOST_CALL) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

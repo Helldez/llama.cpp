@@ -14112,6 +14112,17 @@ void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
     UNUSED(buffer);
 }
 
+// an integrated GPU's memory mapped host-coherent is host memory: the host writes it in place
+void * ggml_backend_vk_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    const vk_buffer & buf = ctx->dev_buffer;
+    const vk::MemoryPropertyFlags need = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    if (!buf || buf->ptr == nullptr || !buf->device->uma || (buf->memory_property_flags & need) != need) {
+        return nullptr;
+    }
+    return buf->ptr;
+}
+
 enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_init_tensor(" << buffer << " (" << buffer->context << "), " << tensor << ")");
     if (tensor->view_src != nullptr) {

@@ -226,6 +226,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
 void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer);
 void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer);
+void * ggml_backend_vk_buffer_get_host_base(ggml_backend_buffer_t buffer);
 enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor);
 void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size);

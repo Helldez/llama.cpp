@@ -408,6 +408,9 @@ extern "C" {
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+        bool    moe_cache_host_call;   // look up the experts inside the graph where the device can wait for the host (no split per layer) [EXPERIMENTAL]
+        int32_t moe_cache_cpu_threads; // with moe_cache_host_call, threads that compute the CPU share of the misses inside the graph, 0 = the share splits the graph [EXPERIMENTAL]
+        int32_t moe_cache_read_ahead;  // experts per token of the next cached layer predicted from this layer's input and filled ahead, 0 = none [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -582,6 +585,21 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+
+    // [EXPERIMENTAL] one MoE cache slot to fill in place with the bytes of one expert of w
+    struct llama_moe_cache_fill {
+        const struct ggml_tensor * w;      // the host experts the slot caches
+        int32_t                    expert; // the expert of w
+        void                     * dst;    // w->nb[2] bytes of device memory the host writes
+    };
+    // async == false: fills every slot, after the fills started before, and returns when all are done (n_fills may be 0)
+    // async == true: starts filling and returns at once, the fills array is valid only during the call;
+    //                the device reads none of these slots until a later call with async == false returns
+    typedef void (*llama_moe_cache_fill_fn)(void * user_data, const struct llama_moe_cache_fill * fills, size_t n_fills, bool async);
+    // [EXPERIMENTAL] fill the MoE cache misses in place instead of uploading them from w->data,
+    // for a device whose memory the host writes directly (unified memory)
+    // returns false if the context has no MoE cache or a cache buffer has no host address
+    LLAMA_API bool llama_set_moe_cache_fill(struct llama_context * ctx, llama_moe_cache_fill_fn fn, void * user_data);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);

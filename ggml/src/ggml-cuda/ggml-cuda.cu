@@ -49,6 +49,7 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sleep.cuh"
+#include "ggml-cuda/host-call.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -994,6 +995,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (host_mailbox != nullptr) {
+        CUDA_CHECK(cudaFreeHost(host_mailbox));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1044,6 +1048,21 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
+}
+
+// managed memory of an integrated device is host memory the host may store to, also while kernels run elsewhere
+static void * ggml_backend_cuda_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (ctx->dev_ptr == nullptr || !ggml_cuda_unified_memory_enabled()) {
+        return nullptr;
+    }
+    int integrated = 0, concurrent = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, ctx->device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, ctx->device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return integrated && concurrent ? ctx->dev_ptr : nullptr;
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1258,6 +1277,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .set_tensor_n    = */ ggml_backend_cuda_buffer_set_tensor_n,
     /* .get_tensor_n    = */ ggml_backend_cuda_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ ggml_backend_cuda_buffer_cpy_tensor_n,
+    /* .get_host_base   = */ ggml_backend_cuda_buffer_get_host_base,
 };
 
 // cuda buffer type
@@ -3156,6 +3176,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SLEEP:
             ggml_cuda_op_sleep(ctx, dst);
             break;
+        case GGML_OP_HOST_CALL:
+            ggml_cuda_op_host_call(ctx, dst);
+            break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
@@ -3474,6 +3497,8 @@ static int ggml_cuda_graph_chunk_size() {
 }
 
 // end the capture of chunk `idx`, update or create its executable and launch it
+// a graph with host calls is launched only once it is captured whole: a chunk launched early would wait on the device
+// for a host that is still capturing, and a capture step that waits for the device (a pool that grows) never returns
 static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
     cudaGraph_t cuda_graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
@@ -3490,7 +3515,9 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     }
     CUDA_CHECK(cudaGraphDestroy(cuda_graph));
 
-    CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+    if (cuda_ctx->host_calls_in_graph == 0) {
+        CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+    }
 }
 #endif // USE_CUDA_GRAPH
 
@@ -5323,7 +5350,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
-    const int         chunk_size = ggml_cuda_graph_chunk_size();
+    // a graph with host calls is launched whole once captured (see ggml_cuda_graph_launch_chunk): no chunks
+    const int         chunk_size = cuda_ctx->host_calls_in_graph > 0 ? 0 : ggml_cuda_graph_chunk_size();
     int               chunk_end  = chunk_size;
     size_t            n_chunks   = 0;
 #endif // USE_CUDA_GRAPH
@@ -5518,6 +5546,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             graph->instances.resize(n_chunks);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
+            if (cuda_ctx->host_calls_in_graph > 0) {
+                for (cudaGraphExec_t instance : graph->instances) {
+                    CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+                }
+            }
+
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
@@ -5606,6 +5640,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    cuda_ctx->host_calls_in_graph = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        cuda_ctx->host_calls_in_graph += node->op == GGML_OP_HOST_CALL && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5617,6 +5657,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // a launched CUDA graph waits on the device for the host calls in it, evaluated node by node they were made inline
+    if (use_cuda_graph) {
+        ggml_cuda_host_call_serve(*cuda_ctx, cuda_ctx->host_calls_in_graph);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6827,6 +6872,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_HOST_CALL:
+            return ggml_cuda_host_call_supported(op);
         case GGML_OP_SLEEP:
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             return false;

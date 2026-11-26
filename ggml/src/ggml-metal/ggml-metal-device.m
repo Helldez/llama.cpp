@@ -1632,6 +1632,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TRANSPOSE:
         case GGML_OP_PERMUTE:
             return true;
+        case GGML_OP_HOST_CALL:
+            // the host reads the inputs and writes the output in place: memory both address
+            return dev->props.use_shared_buffers && ggml_is_contiguous(op->src[0]) &&
+                (op->src[1] == NULL || ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONCAT:
             {
                 const enum ggml_type src0_type = op->src[0]->type;

@@ -1116,9 +1116,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+    "HOST_CALL",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1232,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+    "host_call(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6199,6 +6201,47 @@ struct ggml_tensor * ggml_sleep(
 
     result->op     = GGML_OP_SLEEP;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_host_call
+
+struct ggml_tensor * ggml_host_call(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        enum ggml_type        type,
+        int64_t               ne0,
+        int64_t               ne1,
+        ggml_host_call_t      fn,
+        void                * userdata) {
+    return ggml_host_call_2(ctx, a, NULL, type, ne0, ne1, fn, userdata);
+}
+
+struct ggml_tensor * ggml_host_call_2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        type,
+        int64_t               ne0,
+        int64_t               ne1,
+        ggml_host_call_t      fn,
+        void                * userdata) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(b == NULL || ggml_is_contiguous(b));
+    GGML_ASSERT(fn != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+
+    struct ggml_host_call_op_params params = {
+        /*.fn       =*/ fn,
+        /*.userdata =*/ userdata,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_HOST_CALL;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }

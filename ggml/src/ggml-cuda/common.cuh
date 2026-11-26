@@ -1427,6 +1427,13 @@ struct ggml_backend_cuda_context {
 
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
 
+    // see host-call.cuh: mapped pinned memory, its device address, and the last request answered
+    struct ggml_cuda_host_mailbox * host_mailbox     = nullptr;
+    struct ggml_cuda_host_mailbox * host_mailbox_dev = nullptr;
+    uint64_t                        host_mailbox_seq = 0;
+    int                             host_calls_captured = 0; // kernels captured since the last serve
+    int                             host_calls_in_graph = 0; // host calls of the graph being computed
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

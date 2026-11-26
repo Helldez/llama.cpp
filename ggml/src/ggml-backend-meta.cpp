@@ -1760,6 +1760,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {

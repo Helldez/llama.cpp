@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "llama.h"
 
 #include <map>
 #include <memory>
@@ -24,10 +25,18 @@ struct llama_moe_cache_lookup {
     int32_t       il      = -1;
     ggml_tensor * slots   = nullptr; // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, nullptr if the layer does not read the cache
     ggml_tensor * cpu_ids = nullptr; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
+    ggml_tensor * cpu_in  = nullptr; // EXP: the expert input when the host computes the misses inside the graph (see build_experts)
 };
 
 // builds the experts selected by mm_ids up to the down projection, from the MoE cache if cached: [n_embd, n_expert_used, n_tokens]
 // cur is the expert input and ids are the selected experts, for the biases and scales (see llm_graph_context::build_moe_ffn)
+// how the cache serves its misses, see llama_context_params
+struct llama_moe_cache_options {
+    bool    host_call   = false; // lookup inside the graph where the device supports GGML_OP_HOST_CALL
+    int32_t cpu_threads = 0;     // with host_call: a CPU worker computes the CPU share of the misses inside the graph
+    int32_t read_ahead  = 0;     // experts per token of the next layer predicted and filled while this layer computes
+};
+
 using llama_moe_cache_build_experts_t = ggml_tensor * (*)(ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data);
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
@@ -36,7 +45,8 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
+            const llama_moe_cache_options & opts = {});
     ~llama_moe_cache();
 
     // the experts of w in the cache, nullptr if w is not cached
@@ -46,7 +56,7 @@ public:
 
     // 1. the lookup of the selected experts in the cache, built after the expert input and before the expert matmuls
     //    returns no slots if the layer does not read its experts from the cache for this ubatch
-    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts) const;
+    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts, ggml_tensor * cur = nullptr) const;
 
     // 2. the experts of a layer with slots, from the cache and from the host experts: [n_embd, n_expert_used, n_tokens]
     // calls build synchronously; does not retain user_data
@@ -59,6 +69,9 @@ public:
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+
+    // fill the misses in place with fn instead of uploading them, false if a cache buffer has no host address
+    bool set_fill(llama_moe_cache_fill_fn fn, void * user_data);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

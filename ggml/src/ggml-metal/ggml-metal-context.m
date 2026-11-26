@@ -9,6 +9,7 @@
 #import "ggml-metal-fusion.h"
 
 #import <Foundation/Foundation.h>
+#include <mach/mach_time.h>
 
 #import <Metal/Metal.h>
 
@@ -82,6 +83,13 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // host calls (GGML_OP_HOST_CALL): the device signals hc_value + 1 when it reaches a call, the host replies hc_value + 2
+    id<MTLSharedEvent>   hc_event;
+    id<MTLCommandQueue>  hc_queue; // signals the replies: a value set by the host itself can be missed by a waiting GPU
+    uint64_t             hc_value;
+    void             * hc_src;      // the inputs of a two-input call, packed as the call expects
+    size_t             hc_src_size;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -194,6 +202,16 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->hc_event) {
+        [ctx->hc_event release];
+        ctx->hc_event = nil;
+    }
+    if (ctx->hc_queue) {
+        [ctx->hc_queue release];
+        ctx->hc_queue = nil;
+    }
+    free(ctx->hc_src);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -471,7 +489,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
-enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+static enum ggml_status ggml_metal_graph_compute_plain(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -679,6 +697,117 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+// the host side of one call: the device has reached it, so its inputs are complete and nothing reads its output yet
+static void ggml_metal_host_call_answer(ggml_metal_t ctx, const struct ggml_tensor * node) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    const struct ggml_host_call_op_params * p = (const struct ggml_host_call_op_params *) node->op_params;
+
+    const void * src = ggml_backend_tensor_host_ptr(src0);
+    void       * dst = ggml_backend_tensor_host_ptr(node);
+    GGML_ASSERT(src != NULL && dst != NULL && "host call on memory the host cannot address");
+    size_t src_size = ggml_nbytes(src0);
+    if (src1 != NULL) {
+        const void * s1 = ggml_backend_tensor_host_ptr(src1);
+        GGML_ASSERT(s1 != NULL && "host call on memory the host cannot address");
+        const size_t off = GGML_PAD(src_size, 16);
+        const size_t n   = off + ggml_nbytes(src1);
+        if (ctx->hc_src_size < n) {
+            free(ctx->hc_src);
+            ctx->hc_src      = malloc(n);
+            ctx->hc_src_size = n;
+        }
+        memcpy(ctx->hc_src, src, src_size);
+        memcpy((uint8_t *) ctx->hc_src + off, s1, ggml_nbytes(src1));
+        src      = ctx->hc_src;
+        src_size = n;
+    }
+    p->fn(src, src_size, dst, ggml_nbytes(node), p->userdata);
+}
+
+// a graph with host calls: each segment between two calls is queued, then a command buffer that signals the event (the
+// device reached the call) and waits for the host's reply value. The host queues the next segment before it answers a
+// call, so the device finds work queued behind each reply, and the graph is not ended at a call. A call is answered
+// as soon as the next segment is queued: the device never waits longer than one segment's encoding plus the call.
+static void ggml_metal_host_call_serve(ggml_metal_t ctx, const struct ggml_tensor * node, uint64_t reached) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    const uint64_t t0 = mach_absolute_time();
+    while (ctx->hc_event.signaledValue < reached) {
+        if ((mach_absolute_time() - t0)*tb.numer/tb.denom > 60ull*1000*1000*1000) {
+            GGML_ABORT("%s: the device did not reach a host call in 60 s", __func__);
+        }
+    }
+    ggml_metal_host_call_answer(ctx, node);
+    // the host sets the reply value (fast), and a second queue signals it again: a value set by the host alone can
+    // leave the waiting GPU asleep (about once in a thousand calls, until the GPU timeout)
+    ctx->hc_event.signaledValue = reached + 1;
+    id<MTLCommandBuffer> cb = [ctx->hc_queue commandBufferWithUnretainedReferences];
+    [cb encodeSignalEvent:ctx->hc_event value:reached + 1];
+    [cb commit];
+}
+
+enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    bool any = false;
+    for (int i = 0; i < gf->n_nodes && !any; ++i) {
+        any = gf->nodes[i]->op == GGML_OP_HOST_CALL;
+    }
+    if (!any) {
+        return ggml_metal_graph_compute_plain(ctx, gf);
+    }
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        if (ctx->hc_event == nil) {
+            ctx->hc_event = [ggml_metal_device_get_obj(ctx->dev) newSharedEvent];
+            ctx->hc_queue = [ggml_metal_device_get_obj(ctx->dev) newCommandQueue];
+            ctx->hc_value = 0;
+        }
+
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        const struct ggml_tensor * pending = NULL; // the call queued last, answered once the segment after it is queued
+        uint64_t pending_reached = 0;
+
+        int a = 0;
+        for (int i = 0; i <= gf->n_nodes; ++i) {
+            if (i < gf->n_nodes && gf->nodes[i]->op != GGML_OP_HOST_CALL) {
+                continue;
+            }
+            if (i > a && status == GGML_STATUS_SUCCESS) {
+                struct ggml_cgraph seg = *gf; // a view of nodes [a, i), as ggml_graph_view (not exported) makes it
+                seg.size      = 0;
+                seg.n_nodes   = i - a;
+                seg.n_leafs   = 0;
+                seg.nodes     = gf->nodes + a;
+                seg.grads     = NULL;
+                seg.grad_accs = NULL;
+                seg.leafs     = NULL;
+                seg.uid       = 0;
+                status = ggml_metal_graph_compute_plain(ctx, &seg);
+            }
+            a = i + 1;
+            // a failed segment still lets the queued calls through, so the queue drains
+            if (pending != NULL) {
+                ggml_metal_host_call_serve(ctx, pending, pending_reached);
+                pending = NULL;
+            }
+            if (i == gf->n_nodes || status != GGML_STATUS_SUCCESS) {
+                break;
+            }
+            id<MTLCommandBuffer> cb = [queue commandBufferWithUnretainedReferences];
+            [cb encodeSignalEvent:ctx->hc_event value:ctx->hc_value + 1];
+            [cb encodeWaitForEvent:ctx->hc_event value:ctx->hc_value + 2];
+            [cb commit];
+            pending         = gf->nodes[i];
+            pending_reached = ctx->hc_value + 1;
+            ctx->hc_value  += 2;
+        }
+        return status;
+    }
 }
 
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {

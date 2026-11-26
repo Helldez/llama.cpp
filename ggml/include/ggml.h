@@ -432,6 +432,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_HOST_CALL,
 
         GGML_OP_COUNT,
     };
@@ -2604,6 +2605,32 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // wait after this tensor has executed, return value is simply a full view of this tensor
             int32_t               us); // amount of time to wait in microseconds
+
+    // a host function called from inside a graph: fn reads the data of a (contiguous) and writes the result
+    // the backend runs everything before the call, hands a to fn on the host and runs what follows with the result,
+    // without ending the graph: a device backend waits for the host inside the graph instead of splitting it
+    // fn must not use the backend that computes the graph (its stream is busy waiting), other streams are fine
+    typedef void (*ggml_host_call_t)(const void * src, size_t src_size, void * dst, size_t dst_size, void * userdata);
+
+    GGML_API struct ggml_tensor * ggml_host_call(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            enum ggml_type        type,
+            int64_t               ne0,
+            int64_t               ne1,
+            ggml_host_call_t      fn,
+            void                * userdata);
+
+    // the same with a second input b (contiguous or NULL): fn reads a, then b at the offset GGML_PAD(ggml_nbytes(a), 16)
+    GGML_API struct ggml_tensor * ggml_host_call_2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum ggml_type        type,
+            int64_t               ne0,
+            int64_t               ne1,
+            ggml_host_call_t      fn,
+            void                * userdata);
 
     // loss function
 

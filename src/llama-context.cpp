@@ -378,6 +378,9 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.moe_cache_host_call   = params.moe_cache_host_call;
+    cparams.moe_cache_cpu_threads = params.moe_cache_cpu_threads;
+    cparams.moe_cache_read_ahead  = params.moe_cache_read_ahead;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -616,7 +619,11 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            llama_moe_cache_options opts;
+            opts.host_call   = cparams.moe_cache_host_call;
+            opts.cpu_threads = cparams.moe_cache_cpu_threads;
+            opts.read_ahead  = cparams.moe_cache_read_ahead;
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, opts);
         }
 
         sched_reserve();
@@ -1033,6 +1040,10 @@ uint32_t llama_context::n_threads() const {
 
 uint32_t llama_context::n_threads_batch() const {
     return cparams.n_threads_batch;
+}
+
+bool llama_context::set_moe_cache_fill(llama_moe_cache_fill_fn fn, void * user_data) {
+    return moe_cache != nullptr && moe_cache->set_fill(fn, user_data);
 }
 
 llama_memory_t llama_context::get_memory() const {
@@ -4426,6 +4437,9 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.moe_cache_host_call         =*/ false,
+        /*.moe_cache_cpu_threads       =*/ 0,
+        /*.moe_cache_read_ahead        =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4739,6 +4753,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_set_moe_cache_fill(llama_context * ctx, llama_moe_cache_fill_fn fn, void * user_data) {
+    return ctx->set_moe_cache_fill(fn, user_data);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

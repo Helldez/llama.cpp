@@ -76,6 +76,11 @@ extern "C" {
         void         (*get_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors,       void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
         // (optional) batched tensor copies: returns true if all copies were performed, false if unsupported and no copies were performed
         bool         (*cpy_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
+        // (optional) the host address of the buffer's base when the device works on the host's own memory (no bus between
+        // them) and the host may write it with plain stores: a write made while no queued work reads the bytes is seen by
+        // the work submitted after it. NULL otherwise, also for device memory the host reaches over a bus (a BAR window),
+        // where an upload stays faster. Defaults to get_base for host buffers and NULL for the others.
+        void *       (*get_host_base)(ggml_backend_buffer_t buffer);
     };
 
     struct ggml_backend_buffer {

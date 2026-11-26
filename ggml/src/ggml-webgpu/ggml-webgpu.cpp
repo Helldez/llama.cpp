@@ -4425,6 +4425,7 @@ static ggml_backend_buffer_i ggml_backend_webgpu_buffer_interface = {
     /* .set_tensor_n    = */ ggml_backend_webgpu_buffer_set_tensor_n,
     /* .get_tensor_n    = */ ggml_backend_webgpu_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ NULL,
+    /* .get_host_base   = */ NULL,
 };
 
 /* End GGML Backend Buffer Interface */

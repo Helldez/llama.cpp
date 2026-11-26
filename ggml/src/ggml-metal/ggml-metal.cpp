@@ -133,6 +133,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .set_tensor_n  = */ ggml_backend_metal_buffer_shared_set_tensor_n,
     /* .get_tensor_n  = */ ggml_backend_metal_buffer_shared_get_tensor_n,
     /* .cpy_tensor_n  = */ ggml_backend_metal_buffer_shared_cpy_tensor_n,
+    /* .get_host_base = */ ggml_backend_metal_buffer_shared_get_base, // shared storage: host and GPU address the same pages
 };
 
 // private buffer
@@ -242,6 +243,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .set_tensor_n  = */ ggml_backend_metal_buffer_private_set_tensor_n,
     /* .get_tensor_n  = */ ggml_backend_metal_buffer_private_get_tensor_n,
     /* .cpy_tensor_n  = */ ggml_backend_metal_buffer_private_cpy_tensor_n,
+    /* .get_host_base = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
