@@ -522,6 +522,15 @@ struct llama_moe_cache::impl {
     std::vector<device> devices;
     std::vector<group> groups;
     std::vector<layer> layers;
+
+    // layers that run the very expert tensors of an earlier layer (a looped block, weights shared between layers) are
+    // that layer for the cache: one slot map, one set of slots, and its experts counted once. alias[il] is the earlier
+    // layer, -1 for a layer of its own; shared[il] is true for every layer of such a set.
+    std::vector<int32_t> alias;
+    std::vector<bool>    shared;
+    int32_t canon(int32_t il) const {
+        return il >= 0 && il < (int32_t) alias.size() && alias[il] >= 0 ? alias[il] : il;
+    }
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
@@ -664,9 +673,20 @@ struct llama_moe_cache::impl {
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
+        alias.assign(model.layers.size(), -1);
+        shared.assign(model.layers.size(), false);
+        std::vector<std::pair<std::vector<ggml_tensor *>, int32_t>> seen; // expert tensors of each layer cached so far
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                continue;
+            }
+            // the same tensors as a layer already cached: this layer reads that layer's slots
+            const auto same = std::find_if(seen.begin(), seen.end(), [&](const auto & e) { return e.first == experts; });
+            if (same != seen.end()) {
+                alias[il]            = same->second;
+                shared[il]           = true;
+                shared[same->second] = true;
                 continue;
             }
             const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
@@ -682,6 +702,7 @@ struct llama_moe_cache::impl {
                 it->ref = experts;
             }
             it->layers.push_back(il);
+            seen.emplace_back(experts, (int32_t) il);
             for (const ggml_tensor * t : experts) {
                 it->host_bytes         += ggml_nbytes(t);
                 devices[id].host_bytes += ggml_nbytes(t);
@@ -797,6 +818,9 @@ struct llama_moe_cache::impl {
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
+            for (size_t il = 0; il < alias.size(); ++il) {
+                n_tensors_host += alias[il] >= 0 && std::find(g.layers.begin(), g.layers.end(), alias[il]) != g.layers.end(); // a slot map of its own
+            }
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -860,6 +884,20 @@ struct llama_moe_cache::impl {
                     ggml_format_name(l.cpu_map, "moe_cache.cpu_map-%d", il);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
                 }
+            }
+            // a layer that runs the experts of a layer of this group: a slot map of its own, which the graph copies to the
+            // device on its own, filled from that layer's (see copy); the slots and their plan stay that layer's
+            for (size_t ia = 0; ia < alias.size(); ++ia) {
+                if (alias[ia] < 0 || std::find(g.layers.begin(), g.layers.end(), alias[ia]) == g.layers.end()) {
+                    continue;
+                }
+                layer & la = layers[ia];
+                la.ig       = (int32_t) ig;
+                la.experts  = layers[alias[ia]].experts;
+                la.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                ggml_format_name(la.slot_map, "moe_cache.slot_map-%d", (int) ia);
+                layer_of[la.slot_map] = { (int32_t) ia, false };
+                buf_host_size += GGML_PAD(ggml_nbytes(la.slot_map), alignment_host);
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -1102,7 +1140,8 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
-        const int32_t il      = it->second.first;
+        // a layer that runs another layer's experts plans that layer's slots, and gets its slot map
+        const int32_t il      = canon(it->second.first);
         const bool    has_cpu = it->second.second;
         layer & l = layers[il];
         group & g = groups[l.ig];
@@ -1558,14 +1597,17 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
 }
 
 llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts, ggml_tensor * cur) const {
-    const int32_t il = layer.il;
+    // a layer that runs an earlier layer's experts reads that layer's cache (see impl::alias) through a slot map of its
+    // own; the graph's nodes keep the layer's own index in their names
+    const int32_t il = pimpl->canon(layer.il);
     ggml_context * ctx0 = g.ctx0;
 
-    // the experts of the next cached layer, predicted with its router on this layer's expert input
+    // the experts of the next cached layer, predicted with its router on this layer's expert input; not where a layer's
+    // cache is run by another layer too: the prediction is kept per layer, and the second run would replace it
     if (il >= 0 && il < (int32_t) pimpl->layers.size()) {
         auto & l = pimpl->layers[il];
         l.pred = nullptr;
-        if (l.next >= 0 && cur != nullptr && selected_experts->ne[1] == 1) {
+        if (l.next >= 0 && cur != nullptr && selected_experts->ne[1] == 1 && !pimpl->shared[il] && !pimpl->shared[l.next]) {
             ggml_tensor * router = pimpl->layers[l.next].router;
             // the host ranks the logits while it plans the lookup: a sort on the device costs more than the matmul
             ggml_tensor * logits = ggml_mul_mat(ctx0, router, ggml_reshape_2d(ctx0, cur, cur->ne[0], ggml_nelements(cur)/cur->ne[0]));
@@ -1581,8 +1623,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         cpu_part = cpu_part && !(w != nullptr && g.hdmd != nullptr && g.hdmd->rot.count(w) > 0);
     }
 
-    ggml_tensor * cpu_map  = cpu_part ? pimpl->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
-    ggml_tensor * slot_map = pimpl->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
+    ggml_tensor * cpu_map  = cpu_part ? pimpl->get_cpu_map(layer.il, selected_experts->ne[1]) : nullptr;
+    ggml_tensor * slot_map = pimpl->get_slot_map(layer.il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
     if (slot_map == nullptr) {
         return {};
     }
@@ -1633,7 +1675,7 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         }
     }
     ggml_backend_sched_set_tensor_backend(g.sched, slots, pimpl->backend(il));
-    g.cb(slots, "ffn_moe_slots", il);
+    g.cb(slots, "ffn_moe_slots", layer.il);
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(g.gf, slots);
@@ -1652,7 +1694,7 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         cpu_ids = ggml_reshape_2d(ctx0, cpu_ids, selected_experts->ne[0], selected_experts->ne[1]);
     }
 
-    return { il, ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]), cpu_ids, cpu_in };
+    return { layer.il, ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]), cpu_ids, cpu_in };
 }
 
 ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const llama_moe_cache_lookup & lookup,
@@ -1670,12 +1712,12 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const 
     if (lookup.cpu_in != nullptr) {
         // the misses left to the host, computed by the CPU worker while the device computes these experts,
         // collected after them and added in the same order as the CPU part of a split
-        auto & l = pimpl->layers[lookup.il];
+        auto & l = pimpl->layers[pimpl->canon(lookup.il)];
         pimpl->build_side(g, l, cur, selected_experts, build, user_data);
         if (l.side.ok) {
             ggml_tensor * after = ggml_view_1d(g.ctx0, experts, 1, 0);
             ggml_tensor * cpu = ggml_host_call(g.ctx0, after, GGML_TYPE_F32, experts->ne[0], experts->ne[1]*experts->ne[2], &impl::host_collect, &l);
-            ggml_backend_sched_set_tensor_backend(g.sched, cpu, pimpl->backend(lookup.il));
+            ggml_backend_sched_set_tensor_backend(g.sched, cpu, pimpl->backend(pimpl->canon(lookup.il)));
             cpu = ggml_reshape_3d(g.ctx0, cpu, experts->ne[0], experts->ne[1], experts->ne[2]);
             experts = ggml_add(g.ctx0, experts, cpu);
             g.cb(experts, "ffn_moe_down_merged", lookup.il);
