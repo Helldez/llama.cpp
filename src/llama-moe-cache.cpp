@@ -1036,6 +1036,32 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
+    bool can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const {
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !devices[groups[layers[it->second.il].ig].id].direct) {
+            return false;
+        }
+        return ggml_backend_tensor_host_ptr(dst) != nullptr;
+    }
+
+    void fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts) {
+        if (experts.empty()) {
+            return;
+        }
+        // the host writes dst: nothing queued may still read the bytes it held for an earlier graph
+        ggml_backend_synchronize(backend);
+        uint8_t * dst_host = (uint8_t *) ggml_backend_tensor_host_ptr(dst);
+        GGML_ASSERT(dst_host != nullptr);
+        const size_t expert_size = w->nb[2];
+        fill_jobs.clear();
+        for (int32_t e : experts) {
+            fill_jobs.push_back({ w, e, dst_host + (size_t) e*expert_size });
+        }
+        fill(fill_jobs.data(), fill_jobs.size(), false);
+        stats_copy.misses += experts.size();
+        stats_copy.bytes  += experts.size()*expert_size;
+    }
+
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -1661,6 +1687,14 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const 
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+bool llama_moe_cache::can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const {
+    return pimpl->can_fill_experts(w, dst);
+}
+
+void llama_moe_cache::fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts) {
+    pimpl->fill_experts(backend, w, dst, experts);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

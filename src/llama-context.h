@@ -416,6 +416,8 @@ private:
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
+        std::vector<int32_t> fill;     // experts to fill in place (see llama_moe_cache::fill_experts)
+        std::vector<size_t>  fill_pad; // offsets of the padding copied after a filled range
         std::vector<bool>    used;
 
         void reset() {

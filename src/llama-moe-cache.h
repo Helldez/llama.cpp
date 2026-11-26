@@ -70,6 +70,12 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // for large batches, where the copy dst of w is device memory the host writes in place: the experts of w that are
+    // not in the cache are filled straight into dst like the cache's misses (the fill function, on its lanes), instead
+    // of being uploaded from w->data; false if this does not apply, and then nothing was written
+    bool can_fill_experts(const ggml_tensor * w, const ggml_tensor * dst) const;
+    void fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts);
+
     // fill the misses in place with fn instead of uploading them, false if a cache buffer has no host address
     bool set_fill(llama_moe_cache_fill_fn fn, void * user_data);
 

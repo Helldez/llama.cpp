@@ -3194,6 +3194,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // where dst is device memory the host writes, the experts not in the MoE cache are filled into it on the cache's
+    // fill lanes, all at once below, instead of being uploaded one range at a time from the host weights
+    const bool fill = lctx->moe_cache && lctx->moe_cache->can_fill_experts(src, dst);
+    st.fill.clear();
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3214,7 +3219,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                if (fill) {
+                    for (int64_t i = next; i < e; ++i) {
+                        st.fill.push_back((int32_t) i);
+                    }
+                } else {
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                }
             }
             e   += n;
             next = e;
@@ -3224,11 +3235,31 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t offset  = next*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
+        if (fill) {
+            for (int64_t i = next; i <= last; ++i) {
+                st.fill.push_back((int32_t) i);
+            }
+            // the padding is the start of the next expert, unused: filled as zero bytes are, from the host weights
+            if (padding > 0) {
+                st.fill_pad.push_back((last + 1)*expert_size);
+            }
+        } else if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
         }
 
         first = last + 1;
+    }
+
+    if (fill) {
+        if (st.fill.empty() && !st.fill_pad.empty()) {
+            ggml_backend_synchronize(backend); // fill_experts synchronizes; with nothing to fill the padding still waits
+        }
+        lctx->moe_cache->fill_experts(backend, src, dst, st.fill);
+        uint8_t * dst_host = (uint8_t *) ggml_backend_tensor_host_ptr(dst);
+        for (size_t off : st.fill_pad) {
+            memcpy(dst_host + off, (const uint8_t *) src->data + off, std::min<size_t>(expert_size, 512));
+        }
+        st.fill_pad.clear();
     }
 
     return true;
