@@ -381,6 +381,7 @@ llama_context::llama_context(
     cparams.moe_cache_host_call   = params.moe_cache_host_call;
     cparams.moe_cache_cpu_threads = params.moe_cache_cpu_threads;
     cparams.moe_cache_read_ahead  = params.moe_cache_read_ahead;
+    cparams.moe_cache_async_admit = params.moe_cache_async_admit;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -623,6 +624,7 @@ llama_context::llama_context(
             opts.host_call   = cparams.moe_cache_host_call;
             opts.cpu_threads = cparams.moe_cache_cpu_threads;
             opts.read_ahead  = cparams.moe_cache_read_ahead;
+            opts.async_admit = cparams.moe_cache_async_admit;
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, opts);
         }
 
@@ -4477,6 +4479,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_host_call         =*/ false,
         /*.moe_cache_cpu_threads       =*/ 0,
         /*.moe_cache_read_ahead        =*/ 0,
+        /*.moe_cache_async_admit       =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -411,6 +411,7 @@ extern "C" {
         bool    moe_cache_host_call;   // look up the experts inside the graph where the device can wait for the host (no split per layer) [EXPERIMENTAL]
         int32_t moe_cache_cpu_threads; // with moe_cache_host_call, threads that compute the CPU share of the misses inside the graph, 0 = the share splits the graph [EXPERIMENTAL]
         int32_t moe_cache_read_ahead;  // experts per token of the next cached layer predicted from this layer's input and filled ahead, 0 = none [EXPERIMENTAL]
+        bool    moe_cache_async_admit; // with moe_cache_cpu_threads, a small batch's misses are computed on the CPU and enter the cache in the background, if used more than what they evict [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

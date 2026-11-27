@@ -10,6 +10,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -58,6 +59,7 @@ struct moe_cache_lru {
     std::vector<int32_t> uniq;  // the distinct selected experts
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+    std::vector<int32_t>  pending;    // [n_layer*n_expert] slot whose background write brings the key in, -1 if none
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
@@ -83,6 +85,7 @@ struct moe_cache_lru {
         last_use.assign((size_t) n_layer*n_expert, -1);
         clock.assign(n_layer, 0);
         seen.assign(n_expert, 0);
+        pending.assign((size_t) n_layer*n_expert, -1);
     }
 
     // move slot s to the most recently used end of list c
@@ -289,6 +292,42 @@ struct moe_cache_lru {
         }
         clock[il] += n_tokens;
         return true;
+    }
+
+    // a slot for expert e of layer il, which a background write fills: the expert stays a miss until land() maps it
+    // the victim is no expert the current plan() selects; a cached victim is evicted only if it is used less than e
+    // (decayed CRF), so a miss that is not used again does not push out what keeps being used. -1 if none
+    int32_t reserve(int32_t il, int32_t e) {
+        const int32_t key = make_key(il, e);
+        if (pending[key] >= 0 || slot_map[il][e] < n_slots) {
+            return -1;
+        }
+        const int32_t s   = victim(il);
+        const int32_t old = key_of[s];
+        if (old >= 0) {
+            if (decayed_crf(key_layer(old), old) >= decayed_crf(il, key)) {
+                return -1;
+            }
+            slot_map[key_layer(old)][key_expert(old)] = empty;
+            pending[old] = -1; // a write still in flight for the old key is overwritten by the new one, in order
+        } else {
+            n_filled++;
+        }
+        key_of[s]    = key;
+        pending[key] = s;
+        move(s, class_of(key));
+        return s;
+    }
+
+    // the background write of reserve() landed: the key is a hit from now on, unless its slot went to another key
+    void land(int32_t key, int32_t s) {
+        if (pending[key] != s) {
+            return;
+        }
+        pending[key] = -1;
+        if (key_of[s] == key) {
+            slot_map[key_layer(key)][key_expert(key)] = s;
+        }
     }
 
     // give slots to the predicted experts of layer il that are not cached, at most max_fills, in the order given
@@ -652,6 +691,102 @@ struct llama_moe_cache::impl {
     std::vector<moe_cache_lru::fill> fills;
     std::vector<moe_cache_lru::fill> cpu;
 
+    // async_admit (llama_moe_cache_options): every miss of a small batch is computed on the CPU, and the misses used more
+    // than their victims enter the cache through writes a thread of their own makes while the device computes, so no
+    // lookup waits for an upload. A write lands (the expert becomes a hit) at the first lookup after it completed.
+    struct admit_write {
+        ggml_tensor * bank;
+        const void * src;
+        size_t offset;
+        size_t size;
+    };
+    struct admit_job {
+        int32_t ig, key, slot;
+        uint64_t seq;
+    };
+    bool async_admit = false;
+    std::thread admit_worker;
+    std::mutex admit_mtx;
+    std::condition_variable admit_cv;
+    std::vector<std::pair<uint64_t, std::vector<admit_write>>> admit_queue; // under admit_mtx
+    bool admit_quit = false;
+    std::atomic<uint64_t> admit_done{0}; // writes of the jobs up to this seq completed
+    uint64_t admit_seq = 0;              // seq of the last job queued
+    std::vector<admit_job> admit_pending; // queued jobs not landed yet, in seq order
+    size_t n_admit = 0, n_admit_landed = 0;
+    size_t admit_bytes = 0;
+    double t_drain = 0;
+
+    void admit_loop() {
+        std::unique_lock<std::mutex> lock(admit_mtx);
+        for (;;) {
+            admit_cv.wait(lock, [&] { return admit_quit || !admit_queue.empty(); });
+            if (admit_quit && admit_queue.empty()) {
+                return;
+            }
+            auto jobs = std::move(admit_queue);
+            admit_queue.clear();
+            lock.unlock();
+            for (const auto & j : jobs) {
+                for (const admit_write & w : j.second) {
+                    ggml_backend_tensor_set(w.bank, w.src, w.offset, w.size);
+                }
+                admit_done.store(j.first, std::memory_order_release);
+            }
+            lock.lock();
+            admit_cv.notify_all();
+        }
+    }
+
+    // the writes that completed make their experts hits
+    void land_admits() {
+        if (admit_pending.empty()) {
+            return;
+        }
+        const uint64_t done = admit_done.load(std::memory_order_acquire);
+        size_t i = 0;
+        for (; i < admit_pending.size() && admit_pending[i].seq <= done; ++i) {
+            const admit_job & j = admit_pending[i];
+            groups[j.ig].lru.land(j.key, j.slot);
+            n_admit_landed++;
+        }
+        admit_pending.erase(admit_pending.begin(), admit_pending.begin() + i);
+    }
+
+    // before any other write into the banks: a background write queued earlier must not land on a slot after it
+    void drain_admits() {
+        if (admit_pending.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::unique_lock<std::mutex> lock(admit_mtx);
+            admit_cv.wait(lock, [&] { return admit_done.load(std::memory_order_acquire) >= admit_seq; });
+        }
+        t_drain += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        land_admits();
+    }
+
+    // queue the write of expert e of layer il into slot s of group g
+    void queue_admit(group & g, const layer & l, int32_t il, int32_t e, int32_t s) {
+        std::vector<admit_write> ws;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * w = l.experts[ip];
+            const size_t expert_size = w->nb[2];
+            ws.push_back({ g.banks[ip], (const uint8_t *) w->data + (size_t) e*expert_size, (size_t) s*expert_size, expert_size });
+            admit_bytes += expert_size;
+        }
+        const uint64_t seq = ++admit_seq;
+        admit_pending.push_back({ l.ig, g.lru.make_key(il, e), s, seq });
+        n_admit++;
+        std::lock_guard<std::mutex> lock(admit_mtx);
+        if (!admit_worker.joinable()) {
+            admit_worker = std::thread([this] { admit_loop(); });
+        }
+        admit_queue.emplace_back(seq, std::move(ws));
+        admit_cv.notify_all();
+    }
+
     float    cpu_share = 0.0f;
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
@@ -682,12 +817,13 @@ struct llama_moe_cache::impl {
             const llama_moe_cache_options & opts) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         use_host_call = opts.host_call;
+        async_admit   = opts.async_admit && opts.host_call && opts.cpu_threads > 0;
         n_expert_used_of.assign(layers.size(), n_expert_used);
         for (size_t il = 0; il < layers.size(); ++il) {
             layers[il].self = this;
             layers[il].il   = (int32_t) il;
         }
-        if (opts.host_call && opts.cpu_threads > 0 && this->cpu_share > 0.0f) {
+        if (opts.host_call && opts.cpu_threads > 0 && (this->cpu_share > 0.0f || async_admit)) {
             ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (cpu != nullptr) {
                 cpu_backend.reset(ggml_backend_dev_init(cpu, nullptr));
@@ -823,7 +959,7 @@ struct llama_moe_cache::impl {
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
         // one extra slot at the end, CUDA MMQ can read past the last expert
-        n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
+        n_zero = cpu_share > 0.0f || async_admit ? std::min<int32_t>(n_expert_used, 64) : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
@@ -1078,6 +1214,14 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (admit_worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(admit_mtx);
+                admit_quit = true;
+            }
+            admit_cv.notify_all();
+            admit_worker.join();
+        }
         if (worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lock(mtx);
@@ -1227,6 +1371,7 @@ struct llama_moe_cache::impl {
 
         device & dv = devices[g.id];
         const auto tc0 = std::chrono::steady_clock::now();
+        drain_admits();
         if (lo.prefetched) {
             if (direct(g)) {
                 fill(nullptr, 0, false); // the predicted experts of this layer are in their slots
@@ -1533,7 +1678,10 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         // misses left to the host only with a side graph, and only once the cache is full (as for the CPU part of a split)
         const bool side = cur_in != nullptr && l.side.ok && cpu_backend != nullptr;
-        const uint32_t share_q = side && g.lru.n_filled == g.lru.n_slots ? cpu_share_q : 0;
+        // with async admission a small batch leaves every miss to the host, and the cache admits in the background
+        const bool async = async_admit && side && !direct(g) && n_ids <= (size_t) 8*n_used;
+        land_admits();
+        const uint32_t share_q = async ? 65536u : side && g.lru.n_filled == g.lru.n_slots ? cpu_share_q : 0;
         auto n_cpu = [&](size_t n_miss) {
             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
             l.cpu_acc = acc & 0xffff;
@@ -1561,8 +1709,27 @@ struct llama_moe_cache::impl {
             start_side(l);
             n_side++;
         }
+        if (async && !cpu.empty()) {
+            // the most used misses first; a few writes in flight at most, so what lands is still what is used
+            std::sort(cpu.begin(), cpu.end(), [&](const auto & a, const auto & b) {
+                return g.lru.crf[g.lru.make_key(il, a.expert)] > g.lru.crf[g.lru.make_key(il, b.expert)];
+            });
+            for (const auto & f : cpu) {
+                if (admit_pending.size() >= (size_t) n_used) {
+                    break;
+                }
+                const int32_t s = g.lru.reserve(il, f.expert);
+                if (s < 0) {
+                    break;
+                }
+                queue_admit(g, l, il, f.expert, s);
+            }
+        }
 
         size_t bytes = 0;
+        if (!fills.empty()) {
+            drain_admits(); // a background write must not land on one of these slots after it
+        }
         if (direct(g)) {
             // the device waits for this reply: no kernel reads a slot while the host writes it
             fill_jobs.clear();
@@ -1613,6 +1780,10 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (n_admit > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: admitted in the background %zu (%zu landed), %.2f MiB, waited %.1f ms\n",
+                n_admit, n_admit_landed, admit_bytes/1024.0/1024.0, t_drain);
+        }
         if (n_host_call > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: host calls %zu: host %.1f ms, side graphs %zu, waited %.1f ms\n", n_host_call, t_host, n_side, t_side_wait);
         }

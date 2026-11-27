@@ -35,6 +35,7 @@ struct llama_moe_cache_options {
     bool    host_call   = false; // lookup inside the graph where the device supports GGML_OP_HOST_CALL
     int32_t cpu_threads = 0;     // with host_call: a CPU worker computes the CPU share of the misses inside the graph
     int32_t read_ahead  = 0;     // experts per token of the next layer predicted and filled while this layer computes
+    bool    async_admit = false; // with host_call and cpu_threads: small batches compute every miss on the CPU, the cache admits in the background
 };
 
 using llama_moe_cache_build_experts_t = ggml_tensor * (*)(ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data);
