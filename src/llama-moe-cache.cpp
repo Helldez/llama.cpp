@@ -1694,7 +1694,14 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     const bool use_host_call = pimpl->use_host_call;
     ggml_tensor * slots = nullptr;
     // with a CPU worker the misses left to the host are computed inside the graph too (see build_experts)
-    const bool side = use_host_call && cpu_map != nullptr && pimpl->cpu_backend != nullptr && cur != nullptr;
+    bool side = use_host_call && cpu_map != nullptr && pimpl->cpu_backend != nullptr && cur != nullptr;
+    if (side) {
+        // the CPU worker's misses come back through a host call as wide as the experts' output, which a backend
+        // bounds (a mailbox of fixed size): a graph whose output does not fit keeps the CPU part as a split
+        ggml_tensor * probe = ggml_host_call(ctx0, ids, GGML_TYPE_F32, cur->ne[0], selected_experts->ne[0]*selected_experts->ne[1],
+                &impl::host_collect, &pimpl->layers[il]);
+        side = ggml_backend_supports_op(pimpl->backend(il), probe);
+    }
     ggml_tensor * cpu_in = nullptr;
     if (use_host_call && (cpu_map == nullptr || side) && pimpl->layers[layer.il].pred == nullptr) {
         cpu_in = side ? (ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur)) : nullptr;
