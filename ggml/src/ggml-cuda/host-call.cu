@@ -21,16 +21,53 @@ static ggml_cuda_host_mailbox * host_mailbox(ggml_backend_cuda_context & ctx) {
     return ctx.host_mailbox;
 }
 
+// copies n bytes with the threads of one block: 16 bytes per access where both ends allow it, since each access to the
+// mapped mailbox is a transaction over the bus, and a byte per access made a reply of 64 KiB cost tens of microseconds
+// `uncached`: the source is the host's reply, read past any cache (the device read none of it before the ack)
+template <typename T>
+static __device__ __forceinline__ T host_call_load_uncached(const T * p) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return *(const volatile T *) p;
+#else
+    return __ldcv(p);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+template <>
+__device__ __forceinline__ uint4 host_call_load_uncached<uint4>(const uint4 * p) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const volatile uint4 * v = (const volatile uint4 *) p;
+    return make_uint4(v->x, v->y, v->z, v->w);
+#else
+    return __ldcv(p);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+template <bool uncached>
+static __device__ void host_call_copy(uint8_t * dst, const uint8_t * src, const uint64_t n) {
+    uint64_t done = 0;
+    if ((((uintptr_t) dst | (uintptr_t) src) & 15) == 0) {
+        const uint64_t n16 = n/16;
+        uint4 * d = (uint4 *) dst;
+        const uint4 * s = (const uint4 *) src;
+        for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x) {
+            d[i] = uncached ? host_call_load_uncached(s + i) : s[i];
+        }
+        done = n16*16;
+    }
+    for (uint64_t i = done + threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = uncached ? host_call_load_uncached(src + i) : src[i];
+    }
+}
+
 // publishes src, waits for the host to reply with the same sequence number, then copies the reply to dst
 // one block: the kernels after it on the stream start only when it retires
 static __global__ void k_host_call(ggml_cuda_host_mailbox * mb, const uint8_t * src, const uint64_t src0_size,
         const uint8_t * src1, const uint64_t src1_off, const uint64_t src_size, uint8_t * dst,
         const uint64_t dst_size, const uint64_t fn, const uint64_t userdata) {
-    for (uint64_t i = threadIdx.x; i < src0_size; i += blockDim.x) {
-        mb->src[i] = src[i];
-    }
-    for (uint64_t i = threadIdx.x; src1 != nullptr && i < src_size - src1_off; i += blockDim.x) {
-        mb->src[src1_off + i] = src1[i];
+    host_call_copy<false>(mb->src, src, src0_size);
+    if (src1 != nullptr) {
+        host_call_copy<false>(mb->src + src1_off, src1, src_size - src1_off);
     }
     __syncthreads();
 
@@ -53,10 +90,7 @@ static __global__ void k_host_call(ggml_cuda_host_mailbox * mb, const uint8_t * 
     }
     __syncthreads();
 
-    const volatile uint8_t * reply = mb->dst;
-    for (uint64_t i = threadIdx.x; i < dst_size; i += blockDim.x) {
-        dst[i] = reply[i];
-    }
+    host_call_copy<true>(dst, mb->dst, dst_size);
 }
 
 void ggml_cuda_op_host_call(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
