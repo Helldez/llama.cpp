@@ -663,7 +663,9 @@ struct llama_moe_cache::impl {
                 }
                 l = job;
             }
+            const auto t0 = std::chrono::steady_clock::now();
             ggml_backend_graph_compute(cpu_backend.get(), l->side.gf);
+            t_side_compute += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 job = nullptr;
@@ -714,6 +716,8 @@ struct llama_moe_cache::impl {
     uint64_t admit_seq = 0;              // seq of the last job queued
     std::vector<admit_job> admit_pending; // queued jobs not landed yet, in seq order
     size_t n_admit = 0, n_admit_landed = 0;
+    size_t n_admit_used = 0, n_admit_full = 0; // admissions stopped by the victim's use, and by the writes in flight
+    double t_side_compute = 0;                // the CPU worker's time in the side graphs
     size_t admit_bytes = 0;
     double t_drain = 0;
 
@@ -1716,10 +1720,12 @@ struct llama_moe_cache::impl {
             });
             for (const auto & f : cpu) {
                 if (admit_pending.size() >= (size_t) n_used) {
+                    n_admit_full++;
                     break;
                 }
                 const int32_t s = g.lru.reserve(il, f.expert);
                 if (s < 0) {
+                    n_admit_used++;
                     break;
                 }
                 queue_admit(g, l, il, f.expert, s);
@@ -1781,11 +1787,11 @@ struct llama_moe_cache::impl {
 
     void log_stats() const {
         if (n_admit > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: admitted in the background %zu (%zu landed), %.2f MiB, waited %.1f ms\n",
-                n_admit, n_admit_landed, admit_bytes/1024.0/1024.0, t_drain);
+            LLAMA_LOG_INFO("llama_moe_cache: admitted in the background %zu (%zu landed), %.2f MiB, waited %.1f ms; stopped %zu times by the victim's use, %zu by the writes in flight\n",
+                n_admit, n_admit_landed, admit_bytes/1024.0/1024.0, t_drain, n_admit_used, n_admit_full);
         }
         if (n_host_call > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: host calls %zu: host %.1f ms, side graphs %zu, waited %.1f ms\n", n_host_call, t_host, n_side, t_side_wait);
+            LLAMA_LOG_INFO("llama_moe_cache: host calls %zu: host %.1f ms, side graphs %zu (computed in %.1f ms), waited %.1f ms\n", n_host_call, t_host, n_side, t_side_compute, t_side_wait);
         }
         if (n_copy > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: copy callbacks %zu: wait prefetch %.1f ms, wait device %.1f ms, host %.1f ms\n", n_copy, t_wait_pref, t_sync, t_host);
