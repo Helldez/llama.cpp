@@ -601,10 +601,6 @@ extern "C" {
     // for a device whose memory the host writes directly (unified memory)
     // returns false if the context has no MoE cache or a cache buffer has no host address
     LLAMA_API bool llama_set_moe_cache_fill(struct llama_context * ctx, llama_moe_cache_fill_fn fn, void * user_data);
-    // fill the MoE cache's free slots with these experts, each (layer << 16) | expert, in the order given (the hottest
-    // first): nothing cached is evicted, and the filling stops where the cache is full; returns the experts filled
-    // [EXPERIMENTAL]
-    LLAMA_API size_t llama_moe_cache_warm(struct llama_context * ctx, const uint32_t * keys, size_t n);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
