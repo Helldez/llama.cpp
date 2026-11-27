@@ -85,6 +85,9 @@ public:
     // fill the misses in place with fn instead of uploading them, false if a cache buffer has no host address
     bool set_fill(llama_moe_cache_fill_fn fn, void * user_data);
 
+    // fill free slots with these experts ((layer << 16) | expert), in the order given; returns the experts filled
+    size_t warm(const uint32_t * keys, size_t n);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

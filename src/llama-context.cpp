@@ -1046,6 +1046,10 @@ bool llama_context::set_moe_cache_fill(llama_moe_cache_fill_fn fn, void * user_d
     return moe_cache != nullptr && moe_cache->set_fill(fn, user_data);
 }
 
+size_t llama_context::moe_cache_warm(const uint32_t * keys, size_t n) {
+    return moe_cache != nullptr ? moe_cache->warm(keys, n) : 0;
+}
+
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
@@ -4790,6 +4794,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 bool llama_set_moe_cache_fill(llama_context * ctx, llama_moe_cache_fill_fn fn, void * user_data) {
     return ctx->set_moe_cache_fill(fn, user_data);
+}
+
+size_t llama_moe_cache_warm(llama_context * ctx, const uint32_t * keys, size_t n) {
+    return ctx->moe_cache_warm(keys, n);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
