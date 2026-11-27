@@ -24,7 +24,8 @@ static __global__ void mul_mat_vec_f(
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
+    // short rows: one warp per row and blockDim.y rows per block, so no block-wide reduction (see the launcher)
+    const int row         = blockIdx.x*blockDim.y + threadIdx.y;
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -508,9 +509,22 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
+    // a row a warp covers in a few loads is cheaper to reduce within the warp than across the block:
+    // give each row one warp and put several rows in a block, which keeps enough loads in flight
+    int64_t rows_per_block = 1;
+    if (niter_best <= 1 && block_size_best > warp_size) {
+        const int64_t niter_warp = (ncols + 2*warp_size - 1) / (2*warp_size);
+        for (int64_t r = max_block_size/warp_size; r > 1 && rows_per_block == 1; r /= 2) {
+            if (niter_warp <= r && nrows % r == 0) {
+                rows_per_block  = r;
+                block_size_best = warp_size;
+            }
+        }
+    }
+
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
-    const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
-    const dim3 block_dims(block_size_best, 1, 1);
+    const dim3 block_nums(nrows/rows_per_block, nchannels_dst, nsamples_or_ntokens);
+    const dim3 block_dims(block_size_best, rows_per_block, 1);
     switch (block_size_best) {
         case   32: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
