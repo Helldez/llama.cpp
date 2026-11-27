@@ -43,9 +43,11 @@ static __global__ void k_host_call(ggml_cuda_host_mailbox * mb, const uint8_t * 
         __threadfence_system(); // the data before the request
         mb->req = seq;
         while (mb->ack < seq) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#ifdef GGML_USE_HIP
+            __builtin_amdgcn_s_sleep(10); // sleeps for n * [1,64] clock cycles, as allreduce.cu does
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(256);
-#endif
+#endif // GGML_USE_HIP
         }
         __threadfence_system(); // the reply after the ack
     }

@@ -159,6 +159,7 @@ typedef uint32_t ggml_cuda_thread_mask_t;
 #define cudaStreamCaptureStatus musaStreamCaptureStatus
 #define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
 #define cudaStreamIsCapturing musaStreamIsCapturing
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
 
 typedef __mt_bfloat16 nv_bfloat16;
