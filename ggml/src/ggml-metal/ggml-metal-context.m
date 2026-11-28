@@ -699,18 +699,28 @@ static enum ggml_status ggml_metal_graph_compute_plain(ggml_metal_t ctx, struct 
     return GGML_STATUS_SUCCESS;
 }
 
+// the host address of tensor data, NULL where the host has none (tensor data is an address in its buffer's space)
+static void * ggml_metal_host_call_ptr(const struct ggml_tensor * t) {
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    uint8_t * host = (uint8_t *) ggml_metal_buffer_get_host_base(buf);
+    if (host == NULL || t->data == NULL) {
+        return NULL;
+    }
+    return host + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(buf));
+}
+
 // the host side of one call: the device has reached it, so its inputs are complete and nothing reads its output yet
 static void ggml_metal_host_call_answer(ggml_metal_t ctx, const struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
     const struct ggml_tensor * src1 = node->src[1];
     const struct ggml_host_call_op_params * p = (const struct ggml_host_call_op_params *) node->op_params;
 
-    const void * src = ggml_backend_tensor_host_ptr(src0);
-    void       * dst = ggml_backend_tensor_host_ptr(node);
+    const void * src = ggml_metal_host_call_ptr(src0);
+    void       * dst = ggml_metal_host_call_ptr(node);
     GGML_ASSERT(src != NULL && dst != NULL && "host call on memory the host cannot address");
     size_t src_size = ggml_nbytes(src0);
     if (src1 != NULL) {
-        const void * s1 = ggml_backend_tensor_host_ptr(src1);
+        const void * s1 = ggml_metal_host_call_ptr(src1);
         GGML_ASSERT(s1 != NULL && "host call on memory the host cannot address");
         const size_t off = GGML_PAD(src_size, 16);
         const size_t n   = off + ggml_nbytes(src1);

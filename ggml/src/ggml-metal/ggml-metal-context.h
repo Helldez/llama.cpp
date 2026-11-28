@@ -23,6 +23,9 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+// the host address of a buffer's base where the host writes it in place, NULL otherwise (ggml-metal.cpp)
+void * ggml_metal_buffer_get_host_base(struct ggml_backend_buffer * buffer);
+
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
 void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
 

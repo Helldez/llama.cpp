@@ -3308,7 +3308,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             ggml_backend_synchronize(backend); // fill_experts synchronizes; with nothing to fill the padding still waits
         }
         lctx->moe_cache->fill_experts(backend, src, dst, st.fill);
-        uint8_t * dst_host = (uint8_t *) ggml_backend_tensor_host_ptr(dst);
+        uint8_t * dst_host = (uint8_t *) lctx->moe_cache->host_ptr(dst);
         for (size_t off : st.fill_pad) {
             memcpy(dst_host + off, (const uint8_t *) base->data + off, std::min<size_t>(expert_size, 512));
         }

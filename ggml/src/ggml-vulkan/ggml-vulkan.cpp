@@ -14112,8 +14112,12 @@ void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
     UNUSED(buffer);
 }
 
-// an integrated GPU's memory mapped host-coherent is host memory: the host writes it in place
+// exported as "ggml_backend_buffer_get_host_base" (see ggml_backend_vk_reg_get_proc_address): an integrated GPU's memory
+// mapped host-coherent is host memory the host writes in place; NULL for any other buffer
 void * ggml_backend_vk_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->iface.get_base != ggml_backend_vk_buffer_get_base) {
+        return nullptr;
+    }
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     const vk_buffer & buf = ctx->dev_buffer;
     const vk::MemoryPropertyFlags need = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
@@ -17481,6 +17485,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         return (void *) ggml_backend_vk_comm_allreduce_tensor;
     }
 #endif
+    if (strcmp(name, "ggml_backend_buffer_get_host_base") == 0) {
+        return (void *) ggml_backend_vk_buffer_get_host_base;
+    }
     if (strcmp(name, "ggml_backend_fusion_get") == 0) {
         return (void *) ggml_backend_vk_fusion_get;
     }

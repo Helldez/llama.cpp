@@ -1050,8 +1050,13 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
-// managed memory of an integrated device is host memory the host may store to, also while kernels run elsewhere
+// exported as "ggml_backend_buffer_get_host_base" (see ggml_backend_cuda_reg_get_proc_address): managed memory of an
+// integrated device is host memory the host may store to, also while kernels run elsewhere; NULL for any other buffer
+static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer);
 static void * ggml_backend_cuda_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->iface.get_base != ggml_backend_cuda_buffer_get_base) {
+        return nullptr;
+    }
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     if (ctx->dev_ptr == nullptr || !ggml_cuda_unified_memory_enabled()) {
         return nullptr;
@@ -1277,7 +1282,6 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .set_tensor_n    = */ ggml_backend_cuda_buffer_set_tensor_n,
     /* .get_tensor_n    = */ ggml_backend_cuda_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ ggml_backend_cuda_buffer_cpy_tensor_n,
-    /* .get_host_base   = */ ggml_backend_cuda_buffer_get_host_base,
 };
 
 // cuda buffer type
@@ -7074,6 +7078,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_host_base") == 0) {
+        return (void *)ggml_backend_cuda_buffer_get_host_base;
     }
     return nullptr;
 }

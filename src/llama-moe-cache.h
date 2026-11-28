@@ -93,6 +93,9 @@ public:
     ggml_tensor * twin(int32_t il, const ggml_tensor * w) const;
     const ggml_tensor * experts_of(const ggml_tensor * w) const;
     void fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts);
+    // the host address of t's data where the host writes it in place (a host buffer, or a buffer of a cache device whose
+    // backend exports "ggml_backend_buffer_get_host_base"), nullptr if it has none
+    void * host_ptr(const ggml_tensor * t) const;
 
     // fill the misses in place with fn instead of uploading them, false if a cache buffer has no host address
     bool set_fill(llama_moe_cache_fill_fn fn, void * user_data);

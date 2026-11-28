@@ -907,7 +907,6 @@ static const ggml_backend_buffer_i ggml_backend_openvino_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
-    /* .get_host_base   = */ NULL,
 };
 
 // Buffer type interface functions

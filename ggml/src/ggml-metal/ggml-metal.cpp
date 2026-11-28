@@ -133,8 +133,20 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .set_tensor_n  = */ ggml_backend_metal_buffer_shared_set_tensor_n,
     /* .get_tensor_n  = */ ggml_backend_metal_buffer_shared_get_tensor_n,
     /* .cpy_tensor_n  = */ ggml_backend_metal_buffer_shared_cpy_tensor_n,
-    /* .get_host_base = */ ggml_backend_metal_buffer_shared_get_base, // shared storage: host and GPU address the same pages
 };
+
+// exported as "ggml_backend_buffer_get_host_base" (see ggml_backend_metal_get_proc_address): the host address of the base
+// of a buffer the host may write in place with plain stores, NULL if it has none. Host memory, and Metal shared storage
+// (host and GPU address the same pages); private storage has no host address
+void * ggml_metal_buffer_get_host_base(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL || buffer->size == 0) {
+        return NULL;
+    }
+    if (buffer->iface.get_base == ggml_backend_metal_buffer_shared_get_base || ggml_backend_buffer_is_host(buffer)) {
+        return ggml_backend_buffer_get_base(buffer);
+    }
+    return NULL;
+}
 
 // private buffer
 
@@ -243,7 +255,6 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .set_tensor_n  = */ ggml_backend_metal_buffer_private_set_tensor_n,
     /* .get_tensor_n  = */ ggml_backend_metal_buffer_private_get_tensor_n,
     /* .cpy_tensor_n  = */ ggml_backend_metal_buffer_private_cpy_tensor_n,
-    /* .get_host_base = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
@@ -1056,6 +1067,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
         return (void *)ggml_backend_metal_fusion_set_enabled;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_host_base") == 0) {
+        return (void *)ggml_metal_buffer_get_host_base;
     }
 
     return NULL;

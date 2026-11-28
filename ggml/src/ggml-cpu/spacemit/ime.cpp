@@ -1504,7 +1504,6 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
-    /* .get_host_base   = */ NULL,
 };
 
 static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {

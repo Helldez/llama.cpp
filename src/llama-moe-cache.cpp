@@ -514,19 +514,25 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
 
-        // a second backend of the device, whose queue uploads the predicted experts while the first computes
-        ggml_backend_t upload = nullptr; // a backend of the device whose queue the host calls upload the misses on
+        // a second backend of the device, whose queue the host calls upload the misses on: the queue of the graph
+        // waits for the call's reply, so an upload queued there would never run
+        ggml_backend_t upload = nullptr;
 
         // banks and their views
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
-        bool direct = false; // the host writes the banks in place (ggml_backend_buffer_get_host_base), no upload
+        bool direct = false; // the host writes the banks in place (host_base), no upload
+        // the host address of a buffer of this device the host writes in place, nullptr if none: the function the
+        // backend exports as "ggml_backend_buffer_get_host_base", asked of the device's registry once (a capability,
+        // never decided from the device's name); nullptr where the backend exports none, and then misses are uploaded
+        void * (*host_base_fn)(ggml_backend_buffer_t) = nullptr;
 
         // lend: where the banks are bound while no compute buffer holds them, and if one does now
         ggml_backend_buffer_ptr parking;
         ggml_backend_buffer_ptr alias; // the compute buffer seen as weights, so the kernels read the banks as such
         bool lent = false;
+        bool bound = false; // a lending device's banks are placed (bind), not parked
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -552,6 +558,10 @@ struct llama_moe_cache::impl {
         ggml_tensor * router = nullptr;     // the router weights of this layer, to predict its experts from the layer before
         int32_t next = -1;                  // the next cached layer, whose experts this layer predicts
         ggml_tensor * pred = nullptr;       // [n_pred, n_tokens] experts of the next cached layer predicted in the last graph, or nullptr
+        // the read-ahead applies to this layer of the graph (its next router reads its input), whether or not it fills
+        // anything ahead: such a lookup stays a split, as it was when every one of them built a prediction. Letting the
+        // host call take the ones that fill nothing ahead changes the plan and is a choice of its own, not measured
+        bool reads_ahead = false;
         std::vector<int32_t> predicted;     // the experts this layer was predicted to select, by the layer before
         bool prefetched = false;            // experts of this layer are being uploaded on the prefetch queue
         std::vector<int32_t> prefetched_experts;
@@ -631,9 +641,47 @@ struct llama_moe_cache::impl {
     std::vector<llama_moe_cache_fill> fill_jobs;
     moe_cache_memcpy_fill memcpy_fill; // fills the direct devices when no fill function was set
 
+    // the host address of a buffer's memory where the host writes it in place with plain stores (a store made while no
+    // queued work reads the bytes is seen by later work), nullptr if it has none: host buffers, and the buffers of a
+    // cache device whose backend exports the function (device::host_base_fn)
+    void * host_base(ggml_backend_buffer_t buf) const {
+        if (buf == nullptr || ggml_backend_buffer_get_size(buf) == 0) {
+            return nullptr;
+        }
+        if (ggml_backend_buffer_is_host(buf)) {
+            return ggml_backend_buffer_get_base(buf);
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        for (const device & d : devices) {
+            if (d.host_base_fn != nullptr && ggml_backend_get_device(d.backend) == dev) {
+                return d.host_base_fn(buf);
+            }
+        }
+        return nullptr;
+    }
+    // the same for a tensor's data, which is an address in its buffer's own space (a device address for some backends)
+    void * host_ptr(const ggml_tensor * t) const {
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        uint8_t * host = (uint8_t *) host_base(buf);
+        if (host == nullptr || t->data == nullptr) {
+            return nullptr;
+        }
+        return host + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(buf));
+    }
+
     // the slots of group g are written in place by the host, through fill() -- never with an upload
     bool direct(const group & g) const {
         return devices[g.id].direct;
+    }
+    // the read-ahead of graph layer il fills the experts of the next one ahead: only within a group the host writes in
+    // place (see copy), so nowhere else is a prediction built. A lending device is parked while its graphs are reserved:
+    // it predicts there, so the reservation holds the graphs it runs once bound
+    bool fills_ahead(int32_t il, int32_t next) const {
+        if (max_prefetch == 0 || next < 0 || layers[il].ig < 0 || layers[next].ig != layers[il].ig) {
+            return false;
+        }
+        const device & d = devices[groups[layers[il].ig].id];
+        return d.direct || (d.parking && !d.bound);
     }
     void fill(const llama_moe_cache_fill * fills, size_t n, bool async) {
         if (fill_fn != nullptr) {
@@ -866,6 +914,10 @@ struct llama_moe_cache::impl {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i]));
+                if (reg != nullptr) {
+                    d.host_base_fn = (void * (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_get_host_base");
+                }
             }
         }
         if (devices.empty()) {
@@ -1155,12 +1207,12 @@ struct llama_moe_cache::impl {
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
             for (device & d : devices) {
-                d.direct = d.buf != nullptr && ggml_backend_buffer_get_host_base(d.buf.get()) != nullptr;
+                d.direct = d.buf != nullptr && host_base(d.buf.get()) != nullptr;
             }
             for (group & g : groups) {
                 if (devices[g.id].direct) {
                     for (ggml_tensor * bank : g.banks) {
-                        g.banks_host.push_back((uint8_t *) ggml_backend_tensor_host_ptr(bank));
+                        g.banks_host.push_back((uint8_t *) host_ptr(bank));
                     }
                 }
                 for (int32_t il : g.layers) {
@@ -1312,7 +1364,7 @@ struct llama_moe_cache::impl {
         }
         // the misses are written in place where the host addresses the buffer the banks are in now (not the parking
         // buffer, which holds no bank bytes)
-        d.direct = stride && ggml_backend_buffer_get_host_base(buf) != nullptr;
+        d.direct = stride && host_base(buf) != nullptr;
         for (group & g : groups) {
             if (g.id != id) {
                 continue;
@@ -1320,7 +1372,7 @@ struct llama_moe_cache::impl {
             g.banks_host.clear();
             if (d.direct) {
                 for (ggml_tensor * bank : g.banks) {
-                    g.banks_host.push_back((uint8_t *) ggml_backend_tensor_host_ptr(bank));
+                    g.banks_host.push_back((uint8_t *) host_ptr(bank));
                 }
             }
         }
@@ -1366,7 +1418,8 @@ struct llama_moe_cache::impl {
             if (devices[id].parking) {
                 place((int32_t) id, devices[id].parking.get(), 0, false);
                 devices[id].alias.reset(); // its compute buffer is about to be freed
-                devices[id].lent = false;
+                devices[id].lent  = false;
+                devices[id].bound = false;
             }
         }
         invalidate();
@@ -1399,6 +1452,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("%s: MoE cache: the %s compute buffer has no room past what small batches use, %.2f MiB of its own\n",
                 __func__, ggml_backend_buft_name(it->buft), need/1024.0/1024.0);
         }
+        it->bound = true;
         invalidate();
         dirty = true;
         return it->lent;
@@ -1472,7 +1526,7 @@ struct llama_moe_cache::impl {
         if (it == bindings.end() || !devices[groups[layers[it->second.il].ig].id].direct) {
             return false;
         }
-        return ggml_backend_tensor_host_ptr(dst) != nullptr;
+        return host_ptr(dst) != nullptr;
     }
 
     void fill_experts(ggml_backend_t backend, const ggml_tensor * w_in, ggml_tensor * dst, const std::vector<int32_t> & experts) {
@@ -1484,7 +1538,7 @@ struct llama_moe_cache::impl {
         const auto t0 = std::chrono::steady_clock::now();
         ggml_backend_synchronize(backend);
         const auto t1 = std::chrono::steady_clock::now();
-        uint8_t * dst_host = (uint8_t *) ggml_backend_tensor_host_ptr(dst);
+        uint8_t * dst_host = (uint8_t *) host_ptr(dst);
         GGML_ASSERT(dst_host != nullptr);
         const size_t expert_size = w->nb[2];
         fill_jobs.clear();
@@ -1589,8 +1643,8 @@ struct llama_moe_cache::impl {
             pred_logits.resize(ggml_nelements(lo.pred));
         }
         // where the host addresses the memory, the results are read in place once the device is idle; else queued copies
-        const void * sel_host  = ggml_backend_tensor_host_ptr(sel);
-        const void * pred_host = want_pred ? ggml_backend_tensor_host_ptr(lo.pred) : nullptr;
+        const void * sel_host  = host_ptr(sel);
+        const void * pred_host = want_pred ? host_ptr(lo.pred) : nullptr;
         if (sel_host == nullptr) {
             ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         }
@@ -1697,7 +1751,7 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         // nothing queued reads dst now (synchronized above): where the host writes it in place, a store is the copy
-        if (void * dst_host = ggml_backend_tensor_host_ptr(dst)) {
+        if (void * dst_host = host_ptr(dst)) {
             memcpy(dst_host, l.slot_map->data, ggml_nbytes(l.slot_map));
         } else {
             ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
@@ -2048,7 +2102,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     // the experts of the next cached layer of the graph, predicted with its router on this layer's expert input
     if (layer.il >= 0 && layer.il < (int32_t) pimpl->layers.size()) {
         auto & l = pimpl->layers[layer.il]; // the prediction is this layer of the graph's, not the layer whose slots it reads
-        l.pred = nullptr;
+        l.pred        = nullptr;
+        l.reads_ahead = false;
         // every batch the cache serves reads ahead (a verify batch of a draft too), each token predicting its own experts
         const bool served = pimpl->get_slot_map(layer.il, selected_experts->ne[1], selected_experts->ne[0], false) != nullptr;
         // not where the next router reads another width than this layer's expert input (a latent expert input), nor
@@ -2057,7 +2112,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         ggml_tensor * router = l.next >= 0 ? pimpl->layers[l.next].router : nullptr;
         const bool shapes_ok   = router != nullptr && cur != nullptr && router->ne[0] == cur->ne[0];
         const bool own_experts = l.next >= 0 && !pimpl->shared[layer.il] && !pimpl->shared[l.next];
-        if (served && shapes_ok && own_experts) {
+        l.reads_ahead = served && shapes_ok && own_experts && pimpl->max_prefetch > 0;
+        if (l.reads_ahead && pimpl->fills_ahead(il, l.next)) {
             // the host ranks the logits while it plans the lookup: a sort on the device costs more than the matmul
             ggml_tensor * logits = ggml_mul_mat(ctx0, router, ggml_reshape_2d(ctx0, cur, cur->ne[0], ggml_nelements(cur)/cur->ne[0]));
             ggml_set_output(logits);
@@ -2112,7 +2168,7 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         side = ggml_backend_supports_op(pimpl->backend(il), probe);
     }
     ggml_tensor * cpu_in = nullptr;
-    if (use_host_call && (cpu_map == nullptr || side) && pimpl->layers[layer.il].pred == nullptr) {
+    if (use_host_call && (cpu_map == nullptr || side) && !pimpl->layers[layer.il].reads_ahead) {
         cpu_in = side ? (ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur)) : nullptr;
         slots = ggml_host_call_2(ctx0, ids, cpu_in, GGML_TYPE_I32, ggml_nelements(ids), 1, &impl::host_call, &pimpl->layers[il]);
         if (!ggml_backend_supports_op(pimpl->backend(il), slots)) {
@@ -2198,6 +2254,10 @@ ggml_tensor * llama_moe_cache::twin(int32_t il, const ggml_tensor * w) const {
 
 const ggml_tensor * llama_moe_cache::experts_of(const ggml_tensor * w) const {
     return pimpl->base_of(w);
+}
+
+void * llama_moe_cache::host_ptr(const ggml_tensor * t) const {
+    return pimpl->host_ptr(t);
 }
 
 void llama_moe_cache::fill_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<int32_t> & experts) {
