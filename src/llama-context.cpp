@@ -205,6 +205,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.n_expert_used_cap       = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
 
@@ -1478,6 +1479,12 @@ void llama_context::set_embeddings(bool value) {
     }
 
     cparams.embeddings = value;
+}
+
+// A narrower top-k only shrinks the graph, so the buffers reserved for the model's count still fit it
+// and nothing is re-reserved; the graph is rebuilt because allow_reuse compares the cap.
+void llama_context::set_n_expert_used_cap(uint32_t n) {
+    cparams.n_expert_used_cap = n;
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -4807,6 +4814,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_n_expert_used_cap(llama_context * ctx, uint32_t n) {
+    ctx->set_n_expert_used_cap(n);
 }
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {

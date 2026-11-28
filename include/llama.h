@@ -1198,6 +1198,11 @@ extern "C" {
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+    // Route each token of the following decodes to at most n experts per MoE layer (0 = the model's own
+    // count). The router's top-k is taken over the same probabilities and its weights normalised as the
+    // model does; only the count changes, so a cheaper pass of the same model can draft for its full one.
+    LLAMA_API void llama_set_n_expert_used_cap(struct llama_context * ctx, uint32_t n);
+
     // Select which appended NextN block the DECODER_MTP graph runs (offset past
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
     // chain multiple trained NextN heads. Default 0 (first head).

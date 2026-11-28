@@ -55,6 +55,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
+    uint32_t n_expert_used_cap; // at most this many routed experts per token, 0 = the model's count
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
