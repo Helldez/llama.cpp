@@ -1888,6 +1888,13 @@ struct llama_moe_cache::impl {
             write_trace(il, n_used);
         }
 
+        // the read-ahead of the layer before may still be writing this layer's slots: the plan below counts them as
+        // hits, and the device reads them once this reply is given (copy waits the same way)
+        if (l.prefetched) {
+            fill(nullptr, 0, false);
+            l.prefetched = false;
+        }
+
         size_t n_hit = 0;
         // misses left to the host only with a side graph, and only once the cache is full (as for the CPU part of a split)
         const bool side = cur_in != nullptr && l.side.ok && cpu_backend != nullptr;
