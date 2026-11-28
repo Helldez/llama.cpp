@@ -356,6 +356,35 @@ struct moe_cache_lru {
     }
 };
 
+// the experts the router logits [n_expert, n_tokens] predict: the top k of each token, each expert once, in the order
+// of its best logit so that the most likely experts come first where a budget cuts the list
+static void rank_predictions(const std::vector<float> & logits, int64_t n_expert, int64_t n_tokens, size_t k, std::vector<int32_t> & res) {
+    res.clear();
+    if (n_expert <= 0 || k == 0) {
+        return;
+    }
+    k = std::min<size_t>(k, (size_t) n_expert);
+
+    std::vector<float>   best(n_expert, -INFINITY);
+    std::vector<int32_t> order(n_expert);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const float * lt = logits.data() + t*n_expert;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            order[e] = (int32_t) e;
+        }
+        std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int32_t a, int32_t b) { return lt[a] > lt[b]; });
+        for (size_t i = 0; i < k; ++i) {
+            best[order[i]] = std::max(best[order[i]], lt[order[i]]);
+        }
+    }
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (best[e] > -INFINITY) {
+            res.push_back((int32_t) e);
+        }
+    }
+    std::sort(res.begin(), res.end(), [&](int32_t a, int32_t b) { return best[a] > best[b]; });
+}
+
 // gate, up, down or gate_up, down
 static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
@@ -1399,17 +1428,11 @@ struct llama_moe_cache::impl {
             memcpy(pred_logits.data(), pred_host, ggml_nbytes(lo.pred));
         }
         if (lo.pred != nullptr && lo.next >= 0) {
-            pred_next.resize(pred_logits.size());
-            for (size_t i = 0; i < pred_next.size(); ++i) {
-                pred_next[i] = (int32_t) i;
-            }
-            const size_t k = std::min<size_t>(n_pred, pred_next.size());
-            std::partial_sort(pred_next.begin(), pred_next.begin() + k, pred_next.end(), [&](int32_t a, int32_t b) { return pred_logits[a] > pred_logits[b]; });
-            pred_next.resize(k);
+            rank_predictions(pred_logits, lo.pred->ne[0], lo.pred->ne[1], n_pred, pred_next);
         }
 
         // score the prediction of this layer's experts, made by the layer before, against the cache before this plan
-        if (!lo.predicted.empty() && sel->src[0]->ne[1] == 1) {
+        if (!lo.predicted.empty()) {
             const int32_t * slots_now = g.lru.slot_map[il];
             for (int32_t e : ids) {
                 const bool pred_hit = std::find(lo.predicted.begin(), lo.predicted.end(), e) != lo.predicted.end();
@@ -1504,7 +1527,8 @@ struct llama_moe_cache::impl {
         // upload the predicted experts of the next layer of the same group while this layer computes
         if (max_prefetch > 0 && !pred_next.empty() && layers[lo.next].ig == l.ig && (dv.prefetch != nullptr || direct(g))) {
             layer & ln = layers[lo.next];
-            g.lru.admit(canon(lo.next), pred_next.data(), pred_next.size(), il, max_prefetch, prefetch_fills);
+            // the read-ahead of each token of the batch
+            g.lru.admit(canon(lo.next), pred_next.data(), pred_next.size(), il, max_prefetch*(size_t) sel->src[0]->ne[1], prefetch_fills);
             if (!prefetch_fills.empty() && direct(g)) {
                 // written while this layer computes: the victims are no slot this layer reads
                 fill_jobs.clear();
@@ -1824,7 +1848,9 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     if (layer.il >= 0 && layer.il < (int32_t) pimpl->layers.size()) {
         auto & l = pimpl->layers[layer.il]; // the prediction is this layer of the graph's, not the layer whose slots it reads
         l.pred = nullptr;
-        if (l.next >= 0 && cur != nullptr && selected_experts->ne[1] == 1) {
+        // every batch the cache serves reads ahead (a verify batch of a draft too), each token predicting its own experts
+        const bool served = pimpl->get_slot_map(layer.il, selected_experts->ne[1], selected_experts->ne[0], false) != nullptr;
+        if (l.next >= 0 && cur != nullptr && served) {
             ggml_tensor * router = pimpl->layers[l.next].router;
             // the host ranks the logits while it plans the lookup: a sort on the device costs more than the matmul
             ggml_tensor * logits = ggml_mul_mat(ctx0, router, ggml_reshape_2d(ctx0, cur, cur->ne[0], ggml_nelements(cur)/cur->ne[0]));
