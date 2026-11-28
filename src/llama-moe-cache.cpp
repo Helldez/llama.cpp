@@ -691,6 +691,44 @@ struct llama_moe_cache::impl {
         }
     }
     // the fill jobs of the experts fs of the layer whose host experts are `experts`, into the banks of g
+    // fill free slots with these experts, in the order given, until each group is full: nothing cached is evicted
+    // where the host writes the slots in place, the fills are handed over once, so the fill function spreads them
+    size_t warm(const uint32_t * keys, size_t n) {
+        size_t n_warm = 0;
+        std::vector<moe_cache_lru::fill> fs;
+        fill_jobs.clear();
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t il = (int32_t) (keys[i] >> 16);
+            const int32_t e  = (int32_t) (keys[i] & 0xffff);
+            if (il >= (int32_t) layers.size() || layers[il].ig < 0) {
+                continue;
+            }
+            const int32_t ic = canon(il);
+            const layer & l = layers[ic];
+            group & g = groups[l.ig];
+            if (e >= g.lru.n_expert || g.lru.n_filled >= g.lru.n_slots) {
+                continue;
+            }
+            g.lru.admit(ic, &e, 1, -1, 1, fs);
+            if (fs.empty()) {
+                continue;
+            }
+            if (direct(g)) {
+                push_fills(g, l.experts, fs);
+            } else {
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fs[0].expert*expert_size, fs[0].slot*expert_size, expert_size);
+                }
+            }
+            n_warm++;
+        }
+        fill(fill_jobs.data(), fill_jobs.size(), false);
+        fill_jobs.clear();
+        return n_warm;
+    }
+
     size_t push_fills(const group & g, const std::vector<ggml_tensor *> & experts, const std::vector<moe_cache_lru::fill> & fs) {
         size_t bytes = 0;
         for (size_t ip = 0; ip < experts.size(); ++ip) {
@@ -2076,6 +2114,10 @@ void llama_moe_cache::begin_ubatch(int64_t n_tokens) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+size_t llama_moe_cache::warm(const uint32_t * keys, size_t n) {
+    return pimpl->warm(keys, n);
+}
 
 bool llama_moe_cache::set_fill(llama_moe_cache_fill_fn fn, void * user_data) {
     bool any = false;

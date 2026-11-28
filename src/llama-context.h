@@ -76,6 +76,7 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
     bool set_moe_cache_fill(llama_moe_cache_fill_fn fn, void * user_data);
+    size_t moe_cache_warm(const uint32_t * keys, size_t n);
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
