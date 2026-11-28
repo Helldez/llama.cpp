@@ -243,7 +243,8 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .alias_of  = */ NULL,
     };
 
     return buffer;
@@ -251,9 +252,9 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
 
 ggml_backend_buffer_t ggml_backend_buffer_alias(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
-    struct ggml_backend_buffer_i iface = buffer->iface;
-    iface.free_buffer = NULL; // the memory stays the buffer's
-    ggml_backend_buffer_t alias = ggml_backend_buffer_init(buffer->buft, iface, buffer->context, buffer->size);
+    // the same interface: backends recognise their buffers by it (an RPC client sent a view of its own buffer as none)
+    ggml_backend_buffer_t alias = ggml_backend_buffer_init(buffer->buft, buffer->iface, buffer->context, buffer->size);
+    alias->alias_of = buffer; // the memory stays the buffer's
     alias->usage = usage;
     return alias;
 }
@@ -267,7 +268,7 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    if (buffer->iface.free_buffer != NULL) {
+    if (buffer->iface.free_buffer != NULL && buffer->alias_of == NULL) {
         buffer->iface.free_buffer(buffer);
     }
     delete buffer;

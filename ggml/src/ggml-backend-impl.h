@@ -89,6 +89,9 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        // an alias (ggml_backend_buffer_alias) views another buffer's memory: freeing it frees none of that memory, and it
+        // keeps the whole interface, which backends compare to recognise their own buffers
+        struct ggml_backend_buffer * alias_of;
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(

@@ -1128,22 +1128,8 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("%s: MoE cache: lending needs no misses on the CPU, the banks get their own buffer\n", __func__);
             this->lend = false;
         }
-        // lending is validated where the host addresses the device's memory in place (unified memory): elsewhere (a
-        // remote device took down its server) the banks keep a buffer of their own
-        if (this->lend) {
-            for (const device & d : devices) {
-                if (!d.ctx) {
-                    continue;
-                }
-                ggml_backend_buffer_ptr probe(ggml_backend_buft_alloc_buffer(d.buft, ggml_backend_buft_get_alignment(d.buft)));
-                if (!probe || ggml_backend_buffer_get_host_base(probe.get()) == nullptr) {
-                    LLAMA_LOG_WARN("%s: MoE cache: lending needs %s memory the host writes in place, the banks get their own buffer\n",
-                        __func__, ggml_backend_buft_name(d.buft));
-                    this->lend = false;
-                    break;
-                }
-            }
-        }
+        // lending works on any device: where the host does not write the compute buffer in place, the misses are uploaded
+        // into the lent banks on the backend's own queue (fill), ordered before the batch that takes the memory
         for (device & d : devices) {
             if (!d.ctx) {
                 continue;
