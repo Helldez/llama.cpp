@@ -36,6 +36,7 @@ struct llama_moe_cache_options {
     int32_t cpu_threads = 0;     // with host_call: a CPU worker computes the CPU share of the misses inside the graph
     int32_t read_ahead  = 0;     // experts per token of the next layer predicted and filled while this layer computes
     bool    async_admit = false; // with host_call and cpu_threads: small batches compute every miss on the CPU, the cache admits in the background
+    bool    lend        = false; // the banks live in the compute buffer past the bytes small batches use, see llama_moe_cache::bind
 };
 
 using llama_moe_cache_build_experts_t = ggml_tensor * (*)(ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data);
@@ -48,6 +49,16 @@ public:
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
     llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
             const llama_moe_cache_options & opts = {});
+
+    // lending (EXPERIMENTAL): the compute buffer of a device is reserved at least bank_bytes past what small batches use,
+    // the banks are bound there, and a large batch takes that memory: the cache is emptied before it (begin_ubatch) and
+    // refills from the misses of the small batches after, so prefill and generation share one reservation
+    bool lends() const;
+    static int64_t max_small_batch();               // the largest batch that reads and fills the cache
+    size_t bank_bytes(ggml_backend_t backend) const; // the bytes the banks of backend take
+    void park();                                     // unbind from the compute buffer before the scheduler is replaced
+    bool bind(ggml_backend_t backend, ggml_backend_buffer_t buf, size_t offset); // false: no room, the banks got their own buffer
+    void begin_ubatch(int64_t n_tokens);             // before each ubatch
     ~llama_moe_cache();
 
     // the experts of w in the cache, nullptr if w is not cached

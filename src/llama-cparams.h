@@ -62,6 +62,7 @@ struct llama_cparams {
     int32_t moe_cache_cpu_threads;
     int32_t moe_cache_read_ahead;
     bool    moe_cache_async_admit;
+    bool   moe_cache_lend;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

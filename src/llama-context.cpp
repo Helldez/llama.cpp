@@ -382,6 +382,7 @@ llama_context::llama_context(
     cparams.moe_cache_cpu_threads = params.moe_cache_cpu_threads;
     cparams.moe_cache_read_ahead  = params.moe_cache_read_ahead;
     cparams.moe_cache_async_admit = params.moe_cache_async_admit;
+    cparams.moe_cache_lend        = params.moe_cache_lend;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -625,6 +626,7 @@ llama_context::llama_context(
             opts.cpu_threads = cparams.moe_cache_cpu_threads;
             opts.read_ahead  = cparams.moe_cache_read_ahead;
             opts.async_admit = cparams.moe_cache_async_admit;
+            opts.lend        = cparams.moe_cache_lend;
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, opts);
         }
 
@@ -832,6 +834,12 @@ void llama_context::sched_reserve() {
         res->reset();
     }
 
+    // the banks of a lending cache point into the compute buffer the old scheduler frees
+    const bool lend = moe_cache && moe_cache->lends();
+    if (lend) {
+        moe_cache->park();
+    }
+
     sched_new({
         /*.max_nodes  =*/ max_nodes,
         /*.parallel   =*/ cparams.pipeline_parallel,
@@ -912,6 +920,34 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // a lending cache: what the largest batch that reads and fills the cache uses of each compute buffer, and the banks
+    // past it; the buffer is reserved at least that large, so prefill and generation share one reservation
+    std::vector<size_t> lend_offset(backend_ptrs.size(), 0);
+    if (lend && !model.no_alloc()) {
+        // a scheduler kept from an earlier reservation still asks for the lent bytes: measure the graphs alone
+        for (ggml_backend_t b : backend_ptrs) {
+            ggml_backend_sched_set_min_buffer_size(sched.get(), b, 0);
+        }
+        const uint32_t n_small = std::min<uint32_t>((uint32_t) llama_moe_cache::max_small_batch(), n_tokens);
+        std::vector<size_t> small(backend_ptrs.size(), 0);
+        std::vector<size_t> tg(backend_ptrs.size(), 0);
+        graph_reserve(n_small, n_seqs, std::min(n_small, cparams.n_outputs_max), mctx.get(), true, small.data());
+        graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, tg.data());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t bank = moe_cache->bank_bytes(backend_ptrs[i]);
+            if (bank == 0) {
+                continue;
+            }
+            const size_t align = ggml_backend_buft_get_alignment(backend_buft[i]);
+            const size_t used  = std::max(small[i], tg[i]);
+            // a margin over the reserved graphs: the ones served may differ in their outputs
+            lend_offset[i] = GGML_PAD(used + used/8 + (32u << 20), align);
+            ggml_backend_sched_set_min_buffer_size(sched.get(), backend_ptrs[i], lend_offset[i] + bank);
+            LLAMA_LOG_INFO("%s: %10s small batches use %.2f MiB, the MoE cache is lent %.2f MiB past %.2f MiB\n", __func__,
+                    ggml_backend_buft_name(backend_buft[i]), used/1024.0/1024.0, bank/1024.0/1024.0, lend_offset[i]/1024.0/1024.0);
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -931,6 +967,14 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    if (lend && !model.no_alloc()) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (moe_cache->bank_bytes(backend_ptrs[i]) > 0) {
+                moe_cache->bind(backend_ptrs[i], ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]), lend_offset[i]);
+            }
         }
     }
 
@@ -1841,6 +1885,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // a lending cache gives its memory to a large batch and takes it back after
+    if (moe_cache) {
+        moe_cache->begin_ubatch(ubatch.n_tokens);
     }
 
     auto * res = get_gf_res_prev();
@@ -4476,6 +4525,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_cpu_threads       =*/ 0,
         /*.moe_cache_read_ahead        =*/ 0,
         /*.moe_cache_async_admit       =*/ false,
+        /*.moe_cache_lend              =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

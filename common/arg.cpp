@@ -2770,6 +2770,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-cache-lend"},
+        "keep the MoE cache in the compute buffer past what small batches use, so large batches take its memory and it refills after (EXPERIMENTAL)",
+        [](common_params & params) {
+            params.moe_cache_lend = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

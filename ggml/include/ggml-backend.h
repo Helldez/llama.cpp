@@ -69,6 +69,9 @@ extern "C" {
     GGML_API void *                         ggml_backend_buffer_get_host_base (ggml_backend_buffer_t buffer);
     GGML_API void *                         ggml_backend_tensor_host_ptr      (const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
+    // a second handle on the memory of buffer, with its own usage: tensors placed in the memory through it are seen as that usage
+    // (e.g. weights kept in part of a compute buffer); freeing it leaves the memory to buffer, which must outlive it (EXPERIMENTAL)
+    GGML_API ggml_backend_buffer_t         ggml_backend_buffer_alias(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
@@ -370,6 +373,10 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the compute buffer of backend, NULL if none or if it spans several chunks (EXPERIMENTAL, see ggml_gallocr_get_buffer)
+    GGML_API ggml_backend_buffer_t      ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the least the compute buffer of backend is allocated at by the next reserve (EXPERIMENTAL, see ggml_gallocr_set_min_buffer_size)
+    GGML_API void                       ggml_backend_sched_set_min_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend, size_t size);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

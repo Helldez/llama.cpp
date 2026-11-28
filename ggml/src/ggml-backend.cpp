@@ -249,6 +249,15 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     return buffer;
 }
 
+ggml_backend_buffer_t ggml_backend_buffer_alias(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(buffer);
+    struct ggml_backend_buffer_i iface = buffer->iface;
+    iface.free_buffer = NULL; // the memory stays the buffer's
+    ggml_backend_buffer_t alias = ggml_backend_buffer_init(buffer->buft, iface, buffer->context, buffer->size);
+    alias->usage = usage;
+    return alias;
+}
+
 const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
 }
@@ -2575,6 +2584,22 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+ggml_backend_buffer_t ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_get_buffer(sched->galloc, backend_index);
+}
+
+void ggml_backend_sched_set_min_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend, size_t size) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    ggml_gallocr_set_min_buffer_size(sched->galloc, backend_index, size);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

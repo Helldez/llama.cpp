@@ -480,6 +480,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
+    size_t * min_sizes; // [n_buffers] the least the first chunk of each buffer is allocated at, 0 = what the graph needs
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -504,6 +505,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->min_sizes = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->min_sizes != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -569,6 +573,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     ggml_hash_set_free(&galloc->hash_set);
     free(galloc->hash_values);
     free(galloc->bufts);
+    free(galloc->min_sizes);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
@@ -844,6 +849,15 @@ static bool ggml_gallocr_reserve_n_impl(
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
+    // a buffer asked to be larger than the graph needs keeps its first chunk at that size: the graph is laid out from
+    // its start, so the bytes past what the graph uses are the caller's (ggml_gallocr_set_min_buffer_size)
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[i];
+        if (galloc->min_sizes[i] > 0 && talloc->n_chunks > 0 && talloc->chunks[0]->max_size < galloc->min_sizes[i]) {
+            talloc->chunks[0]->max_size = galloc->min_sizes[i];
+        }
+    }
+
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
@@ -1110,6 +1124,20 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+void ggml_gallocr_set_min_buffer_size(ggml_gallocr_t galloc, int buffer_id, size_t size) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    galloc->min_sizes[buffer_id] = size;
+}
+
+ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    struct vbuffer * buf = galloc->buffers[buffer_id];
+    if (buf == NULL || buf->chunks[0] == NULL || buf->chunks[1] != NULL) {
+        return NULL;
+    }
+    return buf->chunks[0];
 }
 
 // utils
